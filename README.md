@@ -208,6 +208,7 @@ Each repo sets its queue in `.mergepatrol/mergepatrol.yml` on its default branch
 version: 1
 label: mergepatrol
 batch_size: 8
+test_current_main: false
 agent:                  # the default model, which every task runs unless it overrides it
   provider: anthropic   # or openai
   model: claude-opus-5-5
@@ -240,6 +241,10 @@ The agent runs Claude Code for Anthropic's models, and Codex for OpenAI's, with 
 The agent has three tasks: resolving a rebase's conflicts, fixing failed checks, and reviewing. Each runs the default model unless `agent.overrides` gives it its own. A task that sets another provider than the default's must set its model too. The dashboard offers each provider's current models by name; the file takes the model's API id, and may name any model the provider serves. A file that still says `resolver:`, the section's old name, reads as `agent:`.
 
 The verify commands run after an agent resolution or fix, before the publish.
+
+`test_current_main` is a repo-only opt-in, off by default. Set it to `true` to disable skipping a lone PR's rebase when its old head is green but behind the target branch. The queue uses its usual rebase and required-check path; it does not merge on the old checks. Batches still share one combined-head CI run. Before each merge or retry, including after a restart, the queue reads the target branch directly and restarts stale work. A batch advances its expected base after each successful merge, so its own progress does not stop the remaining PRs.
+
+This is not an atomic base lock: GitHub's merge API pins the PR head, not the target branch. An outside merge between the final base read and GitHub's merge can still race it. The setting does not change branch protection.
 
 A repo that sets none is not left without checks. MergeLoop reads the workflows in `.github/workflows/` that run on a pull request, and gives the agent the commands they run for it: a review makes one of them fail to show that a change is needed, and a fix runs it before the publish. MergeLoop never uses a command it read from CI to eject a PR, only the ones your file declares, so set `verify` to pin what a resolution and a fix must pass. A workflow step that needs the workflow's context, a secret or another host is left out: the job has the toolchains, not your CI's services.
 

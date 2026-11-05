@@ -48,6 +48,7 @@ struct State {
     config: Option<String>,
     private: bool,
     trunk: String,
+    snapshot_trunk: Option<String>,
     branches: HashMap<String, String>,
     prs: BTreeMap<PrNumber, PullRequest>,
     /// The PR API lags behind a branch update for this many reads, as GitHub's does.
@@ -66,6 +67,8 @@ struct State {
     /// The checks on every commit, unless `checks_on` has the commit.
     checks: BTreeMap<String, CheckState>,
     checks_on: HashMap<String, BTreeMap<String, CheckState>>,
+    trunk_on_checks: HashMap<String, String>,
+    trunk_after_merge: HashMap<PrNumber, String>,
     comments: Vec<(PrNumber, String)>,
     /// The reviews posted on each PR: their body, and how many threads they start.
     reviews: Vec<(PrNumber, String, usize)>,
@@ -107,6 +110,7 @@ struct State {
     /// Whether the next merge never answers, as when a restart cuts the wait short. `Merged`:
     /// GitHub merges it meanwhile; `Pending`: not yet.
     merge_hangs: Option<MergeHang>,
+    merge_hangs_at: Option<PrNumber>,
     /// Each merged PR's merge commit.
     merge_commits: HashMap<PrNumber, String>,
     /// Heads that need a rebase onto the trunk. Every other head is on it.
@@ -365,7 +369,7 @@ impl GitHub for Fake {
         Ok(RepoSnapshot {
             id: "R".into(),
             default_branch: "main".into(),
-            trunk_sha: s.trunk.clone(),
+            trunk_sha: s.snapshot_trunk.as_ref().unwrap_or(&s.trunk).clone(),
             private: s.private,
             merge_method: "merge".into(),
             merge_methods: s
@@ -458,6 +462,9 @@ impl GitHub for Fake {
         if let Some(action) = action {
             action(&mut s);
         }
+        if let Some(trunk) = s.trunk_on_checks.remove(sha) {
+            s.trunk = trunk;
+        }
         Ok(Checks {
             by_name: s.checks_of(sha),
             skipped: s.skipped.iter().cloned().collect(),
@@ -496,14 +503,26 @@ impl GitHub for Fake {
         sha: &str,
         method: &str,
     ) -> Result<MergeOutcome> {
-        let hang = self.state.lock().unwrap().merge_hangs.take();
+        let hang = self.with_mut(|s| {
+            if s.merge_hangs_at.is_none_or(|at| at == number) {
+                s.merge_hangs.take()
+            } else {
+                None
+            }
+        });
         if let Some(hang) = hang {
             if let MergeHang::Merged = hang {
                 self.merge_now(number, sha, method)?;
             }
             std::future::pending::<()>().await;
         }
-        self.merge_now(number, sha, method)
+        let result = self.merge_now(number, sha, method);
+        self.with_mut(|s| {
+            if let Some(trunk) = s.trunk_after_merge.remove(&number) {
+                s.trunk = trunk;
+            }
+        });
+        result
     }
 
     async fn merged_as(

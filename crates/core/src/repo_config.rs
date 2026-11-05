@@ -403,7 +403,9 @@ impl RepoSettings {
         let settings = Self {
             label: config.label.unwrap_or_else(|| defaults.label.clone()),
             batch_size: config.batch_size.unwrap_or(defaults.batch_size),
-            test_current_main: config.test_current_main.unwrap_or(defaults.test_current_main),
+            test_current_main: config
+                .test_current_main
+                .unwrap_or(defaults.test_current_main),
             agent: AgentSettings {
                 provider,
                 model,
@@ -580,6 +582,77 @@ mod tests {
             fix_ci: FixCiSettings::default(),
             branches: vec![],
             review: ReviewOverrides::default(),
+        }
+    }
+
+    #[test]
+    fn current_main_is_an_opt_in_boolean_that_survives_overlays_and_rewrites() {
+        let defaults = defaults();
+        for file in [
+            None,
+            Some(""),
+            Some("version: 1\n"),
+            Some("test_current_main: false\n"),
+        ] {
+            assert!(
+                !RepoSettings::from_file(file, &defaults)
+                    .unwrap()
+                    .test_current_main
+            );
+        }
+        let enabled =
+            RepoSettings::from_file(Some("test_current_main: true\n"), &defaults).unwrap();
+        assert!(enabled.test_current_main);
+        let yaml = enabled.to_yaml(&defaults);
+        assert!(yaml.contains("test_current_main: true"));
+        assert_eq!(
+            RepoSettings::from_file(Some(&yaml), &defaults).unwrap(),
+            enabled
+        );
+        assert!(
+            RepoSettings::from_file(Some("batch_size: 5\n"), &enabled)
+                .unwrap()
+                .test_current_main
+        );
+        let disabled =
+            RepoSettings::from_file(Some("test_current_main: false\n"), &enabled).unwrap();
+        assert!(!disabled.test_current_main);
+        assert!(
+            disabled
+                .to_yaml(&enabled)
+                .contains("test_current_main: false")
+        );
+        assert!(!defaults.to_yaml(&defaults).contains("test_current_main"));
+        let workspace = WorkspaceDefaults::from(enabled);
+        assert!(
+            !serde_json::to_value(&workspace)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("test_current_main")
+        );
+        assert!(!workspace.over(&defaults).test_current_main);
+        let mut old = serde_json::to_value(&defaults).unwrap();
+        old.as_object_mut().unwrap().remove("test_current_main");
+        assert!(
+            !serde_json::from_value::<RepoSettings>(old)
+                .unwrap()
+                .test_current_main
+        );
+    }
+
+    #[test]
+    fn current_main_rejects_non_booleans_and_misspelled_keys() {
+        for yaml in [
+            "test_current_main: 1\n",
+            "test_current_main: 'true'\n",
+            "test_current_main: maybe\n",
+            "test_current_mian: true\n",
+        ] {
+            assert!(
+                RepoSettings::from_file(Some(yaml), &defaults()).is_err(),
+                "{yaml}"
+            );
         }
     }
 

@@ -229,6 +229,8 @@ pub struct PendingMerge {
     pub prs: Vec<PrNumber>,
     pub top: PrNumber,
     pub head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// A batch's branch: the trunk commit it starts from, then each PR merged onto it in order.
@@ -575,6 +577,19 @@ mod tests {
         let typed = serde_json::to_string(&lane).unwrap();
         let again: Lane = serde_json::from_str(&typed).unwrap();
         assert_eq!(again.entries[0].state, EntryState::Held(Hold::Draft));
+    }
+
+    #[test]
+    fn a_pending_merge_from_before_tested_bases_still_reads() {
+        let saved = r#"{"number":1,"prs":[1],"top":1,"head":"h"}"#;
+        let mut pending: PendingMerge = serde_json::from_str(saved).unwrap();
+        assert_eq!(pending.base, None);
+        pending.base = Some("tested".into());
+        assert_eq!(
+            serde_json::from_str::<PendingMerge>(&serde_json::to_string(&pending).unwrap())
+                .unwrap(),
+            pending
+        );
     }
 
     #[test]

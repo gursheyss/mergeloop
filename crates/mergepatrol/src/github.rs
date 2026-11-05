@@ -18,6 +18,9 @@ pub trait GitHub: Send + Sync {
     /// The open PRs of a stack, bottom to top.
     async fn stack_layers(&self, repo: &RepoName, stack: PrNumber) -> Result<Vec<PrNumber>>;
     async fn branch_sha(&self, repo: &RepoName, branch: &str) -> Result<String>;
+    async fn live_branch_sha(&self, repo: &RepoName, branch: &str) -> Result<String> {
+        self.branch_sha(repo, branch).await
+    }
     /// A PR's head, from its pull ref: where a fork PR's head shows in the repo.
     async fn pull_head(&self, repo: &RepoName, number: PrNumber) -> Result<String>;
     /// Whether `head` needs a rebase onto `base`.

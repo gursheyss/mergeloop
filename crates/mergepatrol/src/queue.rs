@@ -898,7 +898,7 @@ async fn tick_lane(
     let installation = gh.installation_id();
     let settings = read.settings.clone();
     let mut units = read.units_into(trunk);
-    let snap = lane_snapshot(gh, repo, read, trunk, &units).await?;
+    let mut snap = lane_snapshot(gh, repo, read, trunk, &units).await?;
     let key = LaneKey {
         installation_id: installation,
         repo: repo.clone(),
@@ -911,6 +911,9 @@ async fn tick_lane(
         if resume_merge(ctx, &settings, gh, &key, &mut lane, &units, merge, &method).await? {
             units.retain(|u| u.number != number);
         }
+    }
+    if settings.test_current_main {
+        snap.trunk_sha = gh.live_branch_sha(repo, trunk).await?;
     }
     sync_lane(ctx, gh, read, &snap, &key, &mut lane, &units, &[]).await?;
 
@@ -1139,7 +1142,7 @@ async fn sync_lane(
         } else if let Some(reason) = unit.hold_reason() {
             Some(reason)
         } else if unit.fork() {
-            match fork_block(gh, key, &snap.trunk_sha, &top).await? {
+            match fork_block(gh, key, &snap.trunk_sha, &top, settings.test_current_main).await? {
                 Some(Block::Hold(reason)) => Some(reason),
                 Some(Block::Eject(why)) => {
                     let why = format!("Ejected: {why}.");
@@ -1517,13 +1520,16 @@ async fn fork_block(
     key: &LaneKey,
     trunk_sha: &str,
     pr: &PullRequest,
+    test_current_main: bool,
 ) -> Result<Option<Block>> {
     let repo = &key.repo;
     let trunk = &key.trunk;
     if gh.awaiting_approval(repo, &pr.head_ref_oid).await? {
         return Ok(Some(Block::Hold(Hold::WorkflowApproval)));
     }
-    if !gh.behind(repo, trunk_sha, &pr.head_ref_oid).await? || green_and_clean(gh, key, pr).await? {
+    if !gh.behind(repo, trunk_sha, &pr.head_ref_oid).await?
+        || (!test_current_main && green_and_clean(gh, key, pr).await?)
+    {
         return Ok(None);
     }
     let rebase_it = format!("rebase it onto `{trunk}` yourself");
@@ -1800,12 +1806,14 @@ async fn start_merge(
     lane: &mut Lane,
     unit: &Unit,
     head: &str,
+    base: Option<&str>,
 ) -> Result<()> {
     lane.merging = Some(PendingMerge {
         number: unit.number,
         prs: unit.prs(),
         top: unit.top().number,
         head: head.to_owned(),
+        base: base.map(str::to_owned),
     });
     ctx.store.save_lane(key, lane).await
 }
@@ -1831,7 +1839,10 @@ async fn resume_merge(
             && u.top().head_ref_oid == merge.head
             && u.hold_reason().is_none()
     });
-    let sha = if open {
+    let current = !open
+        || !settings.test_current_main
+        || merge.base.as_deref() == Some(gh.live_branch_sha(repo, &key.trunk).await?.as_str());
+    let sha = if open && current {
         match gh.merge(repo, merge.top, &merge.head, method).await? {
             MergeOutcome::Merged { sha } => Some(sha),
             MergeOutcome::Rejected(_) => None,
@@ -2090,9 +2101,13 @@ async fn test_and_merge(
     let tested = loop {
         let now = gh.snapshot(repo, &settings.labels()).await?;
         let now_units = units(gh, repo, &now.labeled).await?;
-        let trunk_sha = match key.trunk == now.default_branch {
-            true => now.trunk_sha,
-            false => gh.branch_sha(repo, &key.trunk).await?,
+        let trunk_sha = if settings.test_current_main {
+            gh.live_branch_sha(repo, &key.trunk).await?
+        } else {
+            match key.trunk == now.default_branch {
+                true => now.trunk_sha,
+                false => gh.branch_sha(repo, &key.trunk).await?,
+            }
         };
         if let Some(why) = stale(&trunk_sha, &now_units, batch) {
             break Tested::Stale(why);
@@ -2186,6 +2201,7 @@ async fn merge_batch(
     batch: &Batch,
 ) -> Result<()> {
     let repo = &key.repo;
+    let mut expected_base = batch.trunk_sha.clone();
     for (tested, step) in &batch.steps {
         let now = tested.refreshed(gh, repo).await?;
         if !now.has_label(&settings.label) || now.branch_heads(gh, repo).await? != head_shas(tested)
@@ -2203,12 +2219,14 @@ async fn merge_batch(
         }
         let top = tested.top();
         let method = merge_method(gh, key, snap).await?;
-        start_merge(ctx, key, lane, tested, &top.head_ref_oid).await?;
-        match merge_retrying(gh, repo, top.number, &top.head_ref_oid, &method).await? {
-            MergeOutcome::Merged { sha } => {
+        let base = settings.test_current_main.then_some(expected_base.as_str());
+        start_merge(ctx, key, lane, tested, &top.head_ref_oid, base).await?;
+        match merge_retrying(gh, key, top.number, &top.head_ref_oid, &method, base).await? {
+            Some(MergeOutcome::Merged { sha }) => {
                 let tree = gh.commit_tree(repo, &sha).await?;
                 let merged = Outcome::Merged(sha.clone());
                 finish(ctx, settings, gh, key, lane, tested, merged).await?;
+                expected_base = sha;
                 if tree != step.tree {
                     let why = format!(
                         "the trunk came out as tree {tree}, not the batch's {}",
@@ -2218,9 +2236,16 @@ async fn merge_batch(
                     return Ok(());
                 }
             }
-            MergeOutcome::Rejected(r) => {
+            Some(MergeOutcome::Rejected(r)) => {
                 let reason = Outcome::Ejected(EjectReason::MergeRejected(r));
                 return finish(ctx, settings, gh, key, lane, tested, reason).await;
+            }
+            None => {
+                lane.merging = None;
+                ctx.store.save_lane(key, lane).await?;
+                let why = "the trunk moved outside the queue";
+                record_all(ctx, key, &tested.prs(), "batch-stopped", why).await?;
+                return Ok(());
             }
         }
     }
@@ -2329,19 +2354,25 @@ impl Unreported {
 /// mergeability against the new trunk ("Base branch was modified"). It accepts it moments later.
 async fn merge_retrying(
     gh: &dyn GitHub,
-    repo: &RepoName,
+    key: &LaneKey,
     number: PrNumber,
     head: &str,
     method: &str,
-) -> Result<MergeOutcome> {
+    base: Option<&str>,
+) -> Result<Option<MergeOutcome>> {
     let mut tries = 0;
     loop {
-        match gh.merge(repo, number, head, method).await? {
+        if let Some(base) = base
+            && gh.live_branch_sha(&key.repo, &key.trunk).await? != base
+        {
+            return Ok(None);
+        }
+        match gh.merge(&key.repo, number, head, method).await? {
             MergeOutcome::Rejected(_) if tries < MERGE_RETRIES => {
                 tries += 1;
                 tokio::time::sleep(MERGE_RETRY_AFTER).await;
             }
-            outcome => return Ok(outcome),
+            outcome => return Ok(Some(outcome)),
         }
     }
 }
@@ -2473,6 +2504,7 @@ async fn run_job(
     // Only the job's first pass may skip the rebase, and `as_is` says it did.
     let mut may_skip_rebase = true;
     let mut as_is = false;
+    let mut tested_base = None;
 
     loop {
         let mut now = unit.refreshed(gh, repo).await?;
@@ -2502,6 +2534,7 @@ async fn run_job(
         let event = match &job.phase {
             Phase::Rebasing => 'rebase: {
                 as_is = std::mem::take(&mut may_skip_rebase)
+                    && !settings.test_current_main
                     && merges_as_is(gh, key, lane, &now).await?;
                 if as_is {
                     let base = gh.branch_sha(repo, &key.trunk).await?;
@@ -2518,8 +2551,13 @@ async fn run_job(
                     };
                 }
                 if now.fork() {
-                    let trunk = gh.branch_sha(repo, &key.trunk).await?;
-                    match fork_block(gh, key, &trunk, now.top()).await? {
+                    let trunk = if settings.test_current_main {
+                        gh.live_branch_sha(repo, &key.trunk).await?
+                    } else {
+                        gh.branch_sha(repo, &key.trunk).await?
+                    };
+                    match fork_block(gh, key, &trunk, now.top(), settings.test_current_main).await?
+                    {
                         Some(Block::Eject(why)) => {
                             return Ok(Outcome::Ejected(EjectReason::Fork(why)));
                         }
@@ -2549,7 +2587,11 @@ async fn run_job(
                 event
             }
             Phase::AwaitingChecks { base, .. } => {
-                let trunk = gh.branch_sha(repo, &key.trunk).await?;
+                let trunk = if settings.test_current_main {
+                    gh.live_branch_sha(repo, &key.trunk).await?
+                } else {
+                    gh.branch_sha(repo, &key.trunk).await?
+                };
                 // The refs, not `head_ref_oid`: the PR lags behind our own publish for a few
                 // seconds.
                 if now.branch_heads(gh, repo).await? != heads {
@@ -2671,7 +2713,7 @@ async fn run_job(
                 }
                 event
             }
-            Phase::Merging { head } => {
+            Phase::Merging { head } => 'merging: {
                 // An author's push during the job made heads the review never saw: what
                 // merges is what was reviewed, or what the queue made of it.
                 let reviewed: Vec<(PrNumber, &str, u32)> = now
@@ -2695,7 +2737,22 @@ async fn run_job(
                 } else {
                     let top = now.top().number;
                     let method = merge_method(gh, key, snap).await?;
-                    start_merge(ctx, key, lane, &now, head).await?;
+                    let base = if settings.test_current_main {
+                        tested_base.as_deref()
+                    } else {
+                        None
+                    };
+                    start_merge(ctx, key, lane, &now, head, base).await?;
+                    if settings.test_current_main
+                        && tested_base.as_deref()
+                            != Some(gh.live_branch_sha(repo, &key.trunk).await?.as_str())
+                    {
+                        lane.merging = None;
+                        ctx.store.save_lane(key, lane).await?;
+                        let why = "the trunk moved outside the queue";
+                        record_all(ctx, key, &prs, "base-moved", why).await?;
+                        break 'merging Event::BaseMoved;
+                    }
                     match gh.merge(repo, top, head, &method).await? {
                         MergeOutcome::Merged { sha } => return Ok(Outcome::Merged(sha)),
                         MergeOutcome::Rejected(r) => {
@@ -2715,6 +2772,9 @@ async fn run_job(
             }
         };
 
+        if let Event::Rebased { base, .. } = &event {
+            tested_base = Some(base.clone());
+        }
         job = match job.step(event) {
             Transition::Continue(j) => j,
             Transition::Merged => unreachable!("merges return above"),

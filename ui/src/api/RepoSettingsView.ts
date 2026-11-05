@@ -5,23 +5,23 @@ import type { RepoReviewView } from "./RepoReviewView";
 /**
  * A repo's settings, as its config file sets them.
  */
-export type RepoSettingsView = { label: string, batch_size: number, provider: "anthropic" | "openai" | "openrouter", model: string, effort: string, 
+export type RepoSettingsView = { label: string, batch_size: number, test_current_main: boolean, provider: "anthropic" | "openai" | "openrouter", model: string, effort: string,
 /**
  * A model for one task over the default.
  */
-overrides: ModelOverridesView, verify: Array<string>, 
+overrides: ModelOverridesView, verify: Array<string>,
 /**
  * The agent fixes failed required checks.
  */
-fix_ci: boolean, 
+fix_ci: boolean,
 /**
  * The most fixes a PR gets, before it is ejected.
  */
-fix_ci_attempts: number, 
+fix_ci_attempts: number,
 /**
  * The branches with a queue besides the default branch.
  */
-branches: Array<string>, 
+branches: Array<string>,
 /**
  * The agent's review, over the workspace's settings.
  */

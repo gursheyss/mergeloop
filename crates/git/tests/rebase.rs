@@ -118,7 +118,10 @@ async fn resolution_leaves_untracked_files_out() {
         RebaseStep::Done
     );
 
-    assert_eq!(git.changed_files(wt, &trunk, "HEAD").await.unwrap(), ["a.txt"]);
+    assert_eq!(
+        git.changed_files(wt, &trunk, "HEAD").await.unwrap(),
+        ["a.txt"]
+    );
 }
 
 #[tokio::test]

@@ -3295,6 +3295,23 @@ mod tests {
     use mergepatrol_core::{Hold, PrSummary};
 
     #[test]
+    fn current_main_survives_the_api_and_config_roundtrip() {
+        let defaults = settings();
+        assert!(!defaults.test_current_main);
+        let mut json = serde_json::to_value(RepoSettingsView::from(defaults.clone())).unwrap();
+        json["test_current_main"] = true.into();
+        let enabled = RepoSettings::from(serde_json::from_value::<RepoSettingsView>(json).unwrap());
+        let yaml = enabled.to_yaml(&defaults);
+        let parsed = RepoSettings::from_file(Some(&yaml), &defaults).unwrap();
+        assert!(parsed.test_current_main);
+        let view = RepoSettingsView::from(parsed);
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["test_current_main"],
+            true
+        );
+    }
+
+    #[test]
     fn queueing_says_what_will_hold_or_stop_the_pr() {
         let status = |hold: Option<Hold>, missing: Option<&str>| RepoStatusView {
             state: RepoStateView::On,

@@ -2274,6 +2274,7 @@ mod tests {
             prs: vec![2, 3],
             top: 3,
             head: "h".into(),
+            base: None,
         });
         store.save_lane(&key, &lane).await.unwrap();
         assert_eq!(step(router.clone()).await, "merging");

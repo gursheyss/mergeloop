@@ -301,6 +301,9 @@ impl GitHub for Cached<'_> {
             .value(repo, key, Some(READ_ALL_EVERY), SETTLE, read)
             .await
     }
+    async fn live_branch_sha(&self, repo: &RepoName, branch: &str) -> Result<String> {
+        GitHub::branch_sha(self.gh, repo, branch).await
+    }
     async fn pull_head(&self, repo: &RepoName, number: PrNumber) -> Result<String> {
         let read = GitHub::pull_head(self.gh, repo, number);
         let key = format!("pull:{number}");
@@ -450,6 +453,30 @@ mod tests {
             priority: "mp:priority".into(),
             failed: "mp:failed".into(),
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_live_branch_read_does_not_trust_a_cached_ref(pool: PgPool) {
+        let store = PgStore::migrate(pool).await.unwrap();
+        let (gh, _) = mergepatrol_github::fake::serve(vec![
+            (200, "", r#"{"object":{"sha":"old"}}"#),
+            (200, "", r#"{"object":{"sha":"new"}}"#),
+        ])
+        .await;
+        let cached = Cached {
+            gh: &gh,
+            reader: Reader {
+                installation: 1,
+                reads: &gh,
+                store: &store,
+            },
+        };
+        assert_eq!(cached.branch_sha(&repo(), "main").await.unwrap(), "old");
+        assert_eq!(
+            cached.live_branch_sha(&repo(), "main").await.unwrap(),
+            "new"
+        );
+        assert_eq!(cached.branch_sha(&repo(), "main").await.unwrap(), "old");
     }
 
     fn node(number: PrNumber, state: &str, label: &str) -> Value {
