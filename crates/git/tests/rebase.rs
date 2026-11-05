@@ -96,6 +96,32 @@ async fn conflict_is_resolved_committed_and_listed_with_its_trailer() {
 }
 
 #[tokio::test]
+async fn resolution_leaves_untracked_files_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = tmp.path();
+    sh(wt, &["init", "-q", "-b", "main"]);
+    let root = commit(wt, "a.txt", "one\n", "root");
+    let trunk = commit(wt, "a.txt", "trunk\n", "trunk change");
+    sh(wt, &["checkout", "-q", "--detach", &root]);
+    commit(wt, "a.txt", "pr\n", "pr change");
+    let git = Git;
+
+    let RebaseStep::Conflict { .. } = git.rebase(wt, &trunk, None).await.unwrap() else {
+        panic!("expected a conflict");
+    };
+    std::fs::write(wt.join("a.txt"), "trunk\npr\n").unwrap();
+    std::fs::write(wt.join("\u{1}\u{b0}@@0D@8"), "").unwrap();
+    assert_eq!(
+        git.continue_resolution(wt, "Resolved-by: mergepatrol (test)")
+            .await
+            .unwrap(),
+        RebaseStep::Done
+    );
+
+    assert_eq!(git.changed_files(wt, &trunk, "HEAD").await.unwrap(), ["a.txt"]);
+}
+
+#[tokio::test]
 async fn resolution_that_keeps_the_trunk_drops_the_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let wt = tmp.path();

@@ -255,9 +255,10 @@ impl Git {
     /// Commits the resolved conflict as the commit that did not apply, with its author and
     /// message, plus `trailer`, and goes on with the next commit. A resolution that leaves
     /// nothing to commit, as when the trunk has the change already, drops the commit, as git
-    /// does for a commit that applies empty.
+    /// does for a commit that applies empty. Only tracked files are staged: an untracked file is
+    /// an artifact of what the resolver ran, as its checks, never part of the resolution.
     pub async fn continue_resolution(&self, wt: &Path, trailer: &str) -> Result<RebaseStep> {
-        self.run(wt, &["add", "-A"]).await?;
+        self.run(wt, &["add", "-u"]).await?;
         let staged = !self
             .git(wt, &["diff", "--cached", "--quiet", "HEAD"])
             .status()
