@@ -660,6 +660,8 @@ pub struct SetRepo {
 pub struct RepoSettingsView {
     pub label: String,
     pub batch_size: u32,
+    #[serde(default)]
+    pub test_current_main: bool,
     #[ts(type = "\"anthropic\" | \"openai\" | \"openrouter\"")]
     pub provider: Provider,
     pub model: String,
@@ -736,6 +738,7 @@ impl From<RepoSettings> for RepoSettingsView {
         RepoSettingsView {
             label: s.label,
             batch_size: s.batch_size as u32,
+            test_current_main: s.test_current_main,
             provider: s.agent.provider,
             model: s.agent.model,
             effort: s.agent.effort,
@@ -754,6 +757,7 @@ impl From<RepoSettingsView> for RepoSettings {
         RepoSettings {
             label: v.label.trim().to_owned(),
             batch_size: v.batch_size as usize,
+            test_current_main: v.test_current_main,
             agent: AgentSettings {
                 provider: v.provider,
                 model: v.model.trim().to_owned(),

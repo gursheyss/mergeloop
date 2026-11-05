@@ -264,6 +264,7 @@ mod tests {
             repo_defaults: RepoSettings {
                 label: "mergepatrol".into(),
                 batch_size: 8,
+                test_current_main: false,
                 agent: mergepatrol_core::AgentSettings {
                     provider: Default::default(),
                     model: "m".into(),

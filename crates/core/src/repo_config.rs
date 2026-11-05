@@ -18,6 +18,8 @@ pub struct RepoSettings {
     pub label: String,
     /// The most PRs tested together. 1 tests and merges one PR at a time.
     pub batch_size: usize,
+    #[serde(default)]
+    pub test_current_main: bool,
     pub agent: AgentSettings,
     /// Run after an agent resolution or fix, before the publish.
     pub verify: Vec<String>,
@@ -200,6 +202,7 @@ struct RepoConfig {
     version: Option<u32>,
     label: Option<String>,
     batch_size: Option<usize>,
+    test_current_main: Option<bool>,
     /// `resolver` is its name from before a task could override its model.
     #[serde(default, alias = "resolver")]
     agent: AgentConfig,
@@ -272,6 +275,8 @@ struct Written<'a> {
     label: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_current_main: Option<bool>,
     #[serde(skip_serializing_if = "WrittenAgent::is_empty")]
     agent: WrittenAgent<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,6 +403,7 @@ impl RepoSettings {
         let settings = Self {
             label: config.label.unwrap_or_else(|| defaults.label.clone()),
             batch_size: config.batch_size.unwrap_or(defaults.batch_size),
+            test_current_main: config.test_current_main.unwrap_or(defaults.test_current_main),
             agent: AgentSettings {
                 provider,
                 model,
@@ -497,6 +503,8 @@ impl RepoSettings {
             version: 1,
             label: (self.label != defaults.label).then_some(&self.label),
             batch_size: (self.batch_size != defaults.batch_size).then_some(self.batch_size),
+            test_current_main: (self.test_current_main != defaults.test_current_main)
+                .then_some(self.test_current_main),
             agent: WrittenAgent {
                 provider: model.then_some(s.provider),
                 model: model.then_some(&s.model),
@@ -561,6 +569,7 @@ mod tests {
         RepoSettings {
             label: "mergepatrol".into(),
             batch_size: 8,
+            test_current_main: false,
             agent: AgentSettings {
                 provider: Provider::Anthropic,
                 model: "claude-opus-5-5".into(),

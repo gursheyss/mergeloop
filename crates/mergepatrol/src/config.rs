@@ -90,6 +90,7 @@ impl Config {
         let repo_defaults = RepoSettings {
             label: opt("MERGEPATROL_LABEL", "mergepatrol"),
             batch_size: opt("MERGEPATROL_BATCH_SIZE", "8").parse()?,
+            test_current_main: false,
             agent: AgentSettings {
                 provider,
                 model,

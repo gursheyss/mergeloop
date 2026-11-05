@@ -1458,6 +1458,7 @@ fn ctx(store: Arc<Mem>) -> Ctx {
                 label: TRIGGER.into(),
                 // One PR at a time, unless a test batches.
                 batch_size: 1,
+                test_current_main: false,
                 agent: AgentSettings {
                     provider: Default::default(),
                     model: "m".into(),
@@ -1610,6 +1611,8 @@ fn behind_and_green(s: &mut State) {
     s.add_pr(1);
     s.behind.push("pr-1-v0".into());
 }
+
+mod fresh_base;
 
 #[tokio::test(start_paused = true)]
 async fn a_green_pr_that_merges_cleanly_skips_the_rebase() {
