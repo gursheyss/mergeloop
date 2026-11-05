@@ -327,6 +327,21 @@ async fn run(ctx: &Ctx, gh: &Installation, w: Wanted, claim: Claim) {
         }
         // The author pushed: the next tick reads the new head.
         Ok(Event::HeadMoved) => None,
+        Ok(Event::RebaseFailed(why) | Event::FixFailed(why))
+            if why.contains(mergepatrol_git::REVIEWED_CONTENT_CHANGED) =>
+        {
+            ok(super::eject(
+                ctx,
+                &w.settings,
+                gh,
+                key,
+                &prs,
+                &format!("Ejected: {why}."),
+                "reviewed-content-changed",
+            )
+            .await);
+            None
+        }
         Ok(Event::RebaseFailed(why) | Event::FixFailed(why) | Event::FixGaveUp(why)) => Some(why),
         // A check reads the new title only on a new run: the lane's recheck, which it guards.
         Ok(Event::Retitled) => Some("the agent set a new title, for the lane to recheck".into()),

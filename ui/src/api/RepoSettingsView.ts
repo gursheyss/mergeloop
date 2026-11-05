@@ -5,7 +5,7 @@ import type { RepoReviewView } from "./RepoReviewView";
 /**
  * A repo's settings, as its config file sets them.
  */
-export type RepoSettingsView = { label: string, batch_size: number, test_current_main: boolean, provider: "anthropic" | "openai" | "openrouter", model: string, effort: string,
+export type RepoSettingsView = { label: string, batch_size: number, test_current_main: boolean, preserve_reviewed_content: boolean, provider: "anthropic" | "openai" | "openrouter", model: string, effort: string,
 /**
  * A model for one task over the default.
  */

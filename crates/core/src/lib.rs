@@ -37,6 +37,7 @@ pub type PrNumber = u64;
 pub const FIXED_BY: &str = "Fixed-by: mergepatrol";
 /// The trailer of a commit whose conflict the agent resolved in a rebase.
 pub const RESOLVED_BY: &str = "Resolved-by: mergepatrol";
+pub const FIXES_USED: &str = "MergeLoop-fixes-used:";
 /// The empty commit that runs a PR's checks again.
 pub const RECHECK_MESSAGE: &str =
     "Run the checks again\n\nThe agent found nothing to fix in the code.";
@@ -45,10 +46,17 @@ pub const RECHECK_MESSAGE: &str =
 /// agent's fixes on top of the PR. The author's next commit ends the count, so new code earns new
 /// fixes, and the commits themselves survive a restart or a rebase.
 pub fn fixes_used<'a>(messages: impl IntoIterator<Item = &'a str>) -> u32 {
-    let mut used = 0;
+    let mut used: u32 = 0;
     for message in messages {
+        if let Some(count) = message
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix(FIXES_USED)?.trim().parse::<u32>().ok())
+        {
+            return used.saturating_add(count);
+        }
         if message.lines().any(|l| l.starts_with(FIXED_BY)) {
-            used += 1;
+            used = used.saturating_add(1);
         // A rebase's rewrite adds trailers after it.
         } else if !message.starts_with(RECHECK_MESSAGE) {
             break;
@@ -195,6 +203,13 @@ mod tests {
         let rewritten = format!("{RECHECK_MESSAGE}\n\nCo-authored-by: a <a@example.com>");
         assert_eq!(fixes_used([rewritten.as_str(), fix]), 1);
         assert_eq!(fixes_used([]), 0);
+        let squashed = format!("net change\n\n{FIXES_USED} 3");
+        assert_eq!(fixes_used([squashed.as_str(), fix]), 3);
+        assert_eq!(fixes_used([fix, squashed.as_str(), fix]), 4);
+        let authored = format!("new reviewed code\n\n{FIXES_USED} 0");
+        assert_eq!(fixes_used([authored.as_str(), fix]), 0);
+        let updated = format!("{squashed}\n{FIXES_USED} 4");
+        assert_eq!(fixes_used([updated.as_str()]), 4);
     }
 
     #[test]

@@ -115,6 +115,84 @@ async fn clean_rebase_comes_back_as_a_bundle() {
 }
 
 #[tokio::test]
+async fn the_real_job_preserves_merge_only_tests_and_conflict_fixes() {
+    for conflicting in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        let (_, _) = remote(
+            &origin,
+            "shared.txt",
+            if conflicting {
+                "shared.txt"
+            } else {
+                "other.txt"
+            },
+        );
+        git(&origin, &["checkout", "-q", "pr"]);
+        let merge = Command::new("git")
+            .current_dir(&origin)
+            .args(["merge", "--no-commit", "--no-ff", "main"])
+            .output()
+            .unwrap();
+        assert_eq!(merge.status.success(), !conflicting);
+        std::fs::write(
+            origin.join("shared.txt"),
+            "reviewed integration of feature and main\n",
+        )
+        .unwrap();
+        git(&origin, &["add", "shared.txt"]);
+        std::fs::create_dir_all(origin.join("apps/server/test")).unwrap();
+        let path = "apps/server/test/coach-erase-worker.ts";
+        commit(
+            &origin,
+            path,
+            r#"dropEraseTable() {
+  this.ctx.storage.sql.exec('DROP TABLE coach_erase')
+}
+await destroyedAndEmpty(env.COACH, 'erase-resumed')
+const older = await getAgentByName(env.COACH, 'erase-older')
+await older.dropEraseTable()
+const booted = await outcome((await evict(env.COACH, 'erase-older')).readFoodNumbers())
+check(booted === 'replied', `a coach stored before the erase table answered a read with ${booted}`)
+"#,
+        );
+        git(&origin, &["checkout", "-q", "main"]);
+        commit(&origin, "intermediate.txt", "another main change\n");
+        git(&origin, &["checkout", "-q", "pr"]);
+        git(
+            &origin,
+            &["merge", "-q", "--no-ff", "main", "-m", "merge main again"],
+        );
+        let head = git(&origin, &["rev-parse", "HEAD"]);
+        git(&origin, &["checkout", "-q", "main"]);
+        let trunk = commit(&origin, "later.txt", "main moved again\n");
+        let out = tmp.path().join("out");
+        let result = executor()
+            .run("merge-only-content", &spec(&origin, &head, &trunk), &out)
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, JobOutcome::Done, "{result:?}");
+        git(
+            &origin,
+            &[
+                "fetch",
+                "-q",
+                out.join(BUNDLE_FILE).to_str().unwrap(),
+                "refs/heads/result:refs/heads/result",
+            ],
+        );
+        assert_eq!(git(&origin, &["rev-parse", "result~1"]), trunk);
+        for path in [path, "shared.txt"] {
+            assert_eq!(
+                git(&origin, &["rev-parse", &format!("result:{path}")]),
+                git(&origin, &["rev-parse", &format!("{head}:{path}")])
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_stack_layer_replays_only_its_own_commits_onto_the_layer_below() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin");

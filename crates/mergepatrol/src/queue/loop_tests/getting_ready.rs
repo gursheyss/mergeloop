@@ -73,6 +73,7 @@ struct Agent {
     /// Why the agent cannot do any job, if it cannot.
     fails: Mutex<Option<String>>,
     tasks: Mutex<Vec<Task>>,
+    damage: Mutex<Option<(String, String)>>,
 }
 
 impl Agent {
@@ -138,6 +139,12 @@ impl Executor for Agent {
             Ok(events) => events,
             Err(reason) => return Ok(failed(reason, Vec::new())),
         };
+        if let Some((path, content)) = self.damage.lock().unwrap().as_ref()
+            && dir.path().join(path).exists()
+            && std::fs::read_to_string(dir.path().join(path)).unwrap() != *content
+        {
+            commit(dir.path(), path, content, "agent damaged reviewed content");
+        }
         let exclude = match spec.task {
             Task::Rebase => &spec.trunk_sha,
             _ => &spec.head_sha,
@@ -318,6 +325,45 @@ fn answer(gh: &Fake, origin: &Path, method: &str, path: &str, body: &str) -> (u1
     let Some(rest) = path.strip_prefix("/repos/o/r/") else {
         return (404, "{}".into());
     };
+    let parts: Vec<_> = rest.split('/').collect();
+    match (method, parts.as_slice()) {
+        ("DELETE", ["issues", number, "labels", label]) => {
+            let number = number.parse::<PrNumber>().unwrap();
+            gh.with_mut(|s| {
+                s.prs
+                    .get_mut(&number)
+                    .unwrap()
+                    .labels
+                    .retain(|l| l != label)
+            });
+            return (200, "[]".into());
+        }
+        ("POST", ["issues", number, "labels"]) => {
+            let number = number.parse::<PrNumber>().unwrap();
+            gh.with_mut(|s| {
+                let labels = &mut s.prs.get_mut(&number).unwrap().labels;
+                for label in body["labels"].as_array().unwrap() {
+                    let label = label.as_str().unwrap().to_owned();
+                    if !labels.contains(&label) {
+                        labels.push(label);
+                    }
+                }
+            });
+            return (200, "[]".into());
+        }
+        ("GET", ["issues", _, comments]) if comments.starts_with("comments?") => {
+            return (200, "[]".into());
+        }
+        ("POST", ["issues", number, "comments"]) => {
+            let number = number.parse::<PrNumber>().unwrap();
+            gh.with_mut(|s| {
+                s.comments
+                    .push((number, body["body"].as_str().unwrap().into()))
+            });
+            return (201, "{}".into());
+        }
+        _ => {}
+    }
     if let Some(branch) = rest.strip_prefix("git/ref/heads/") {
         let s = gh.state.lock().unwrap();
         let sha = match branch {
@@ -465,6 +511,7 @@ impl World {
             during: Default::default(),
             fails: Default::default(),
             tasks: Default::default(),
+            damage: Default::default(),
         });
         let store = Arc::new(Mem::default());
         let mut ctx = ctx(store.clone());
@@ -720,6 +767,131 @@ async fn a_conflict_the_lane_finds_is_rebased_off_it_then_merges() {
     assert_eq!(shown, "resolved");
     let on = git(&world.origin, &["rev-parse", &format!("{head}~1")]);
     assert_eq!(on, git(&world.origin, &["rev-parse", "main"]));
+}
+
+#[tokio::test]
+async fn reviewed_content_ejects_clean_and_agent_updates_before_any_push() {
+    for conflict in [false, true] {
+        let world = World::new(
+            |o| {
+                commit(o, "shared.txt", "base\n", "start");
+                git(o, &["checkout", "-q", "-b", "pr-1"]);
+                commit(o, "shared.txt", "from the pr\n", "feature");
+                commit(
+                    o,
+                    "feature.test.ts",
+                    "it('keeps the regression', () => expect(true).toBe(true));\n",
+                    "regression",
+                );
+                git(o, &["checkout", "-q", "main"]);
+                commit(
+                    o,
+                    if conflict { "shared.txt" } else { "other.txt" },
+                    "main advanced\n",
+                    "main",
+                );
+            },
+            |s, o| {
+                add_pr(s, 1, o);
+                s.config =
+                    Some("preserve_reviewed_content: true\ntest_current_main: true\n".into());
+            },
+        )
+        .await;
+        let before = world.branch("pr-1");
+        *world.agent.damage.lock().unwrap() =
+            Some(("feature.test.ts".into(), "// regression removed\n".into()));
+        let _drain = world.drain().await;
+        world.tick_until(|w| w.did(1, "ejected")).await;
+        assert_eq!(world.branch("pr-1"), before);
+        assert!(world.merged().is_empty());
+        assert!(world.gh.with(|s| {
+            s.comments.iter().any(|(_, body)| {
+                body.contains("preserve_reviewed_content:") && body.contains("feature.test.ts")
+            })
+        }));
+    }
+}
+
+#[tokio::test]
+async fn reviewed_content_ejects_ci_fixes_before_any_push_but_is_opt_in() {
+    for enabled in [false, true] {
+        let world = World::one_pr("feature.txt", "other.txt").await;
+        world.gh.with_mut(|s| {
+            s.config = Some(format!("preserve_reviewed_content: {enabled}\n"));
+            checks_fail(s, 1);
+        });
+        let before = world.branch("pr-1");
+        *world.agent.damage.lock().unwrap() =
+            Some(("feature.txt".into(), "agent removed the feature\n".into()));
+        let _drain = world.drain().await;
+        world
+            .tick_until(|w| w.did(1, "ejected") || !w.merged().is_empty())
+            .await;
+        assert_eq!(world.did(1, "ejected"), enabled, "{:?}", world.kinds(1));
+        if enabled {
+            assert_eq!(world.branch("pr-1"), before);
+            assert!(world.merged().is_empty());
+        } else {
+            assert!(!world.merged().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn reviewed_content_ejects_review_fixes_instead_of_only_leaving_findings_open() {
+    let mut world = World::one_pr("feature.txt", "other.txt").await;
+    Arc::get_mut(&mut world.ctx)
+        .unwrap()
+        .config
+        .repo_defaults
+        .preserve_reviewed_content = true;
+    let before = world.branch("pr-1");
+    *world.agent.damage.lock().unwrap() =
+        Some(("feature.txt".into(), "agent removed the feature\n".into()));
+    let review = world.sent_back().await;
+    world.fix_review(review).await;
+    assert!(world.did(1, "ejected"), "{:?}", world.kinds(1));
+    assert_eq!(world.branch("pr-1"), before);
+    assert!(world.merged().is_empty());
+    assert!(!world.pr(1).labels.iter().any(|label| label == TRIGGER));
+}
+
+#[tokio::test]
+async fn reviewed_content_ejects_an_unsafe_fix_after_a_failed_batch() {
+    let world = World::new(
+        |o| {
+            commit(o, "shared.txt", "base\n", "start");
+            for n in [1, 2] {
+                git(o, &["checkout", "-q", "-b", &format!("pr-{n}"), "main"]);
+                commit(o, &format!("f{n}.txt"), "reviewed feature\n", "feature");
+            }
+            git(o, &["checkout", "-q", "main"]);
+        },
+        |s, o| {
+            add_pr(s, 1, o);
+            add_pr(s, 2, o);
+            s.config = Some("preserve_reviewed_content: true\nbatch_size: 5\n".into());
+            s.breaks = Some(1);
+        },
+    )
+    .await;
+    let before = world.branch("pr-1");
+    let _drain = world.drain().await;
+    world.tick().await;
+    assert!(world.did(1, "batch-failed"), "{:?}", world.kinds(1));
+    assert!(world.tasks().is_empty());
+    world.gh.with_mut(|s| checks_fail(s, 1));
+    *world.agent.damage.lock().unwrap() = Some(("f1.txt".into(), "damaged\n".into()));
+    world.tick_until(|w| w.did(1, "ejected")).await;
+    assert_eq!(world.branch("pr-1"), before);
+    assert!(!world.merged().contains(&1));
+    assert!(
+        world
+            .tasks()
+            .iter()
+            .any(|task| matches!(task, Task::FixChecks { .. }))
+    );
 }
 
 #[tokio::test]
@@ -1235,6 +1407,24 @@ async fn a_clean_rebase_keeps_every_layers_approval() {
     assert!(matches!(event, Event::Rebased { .. }), "{event:?}");
     assert_eq!(review_of_head(&world, 1), (ReviewStatus::Approved, None));
     assert_eq!(review_of_head(&world, 2), (ReviewStatus::Approved, None));
+}
+
+#[tokio::test]
+async fn reviewed_content_guards_every_stack_layer_before_the_atomic_update() {
+    for path in ["lower.txt", "upper.txt"] {
+        let mut world = approved_stack("lower.txt", "upper.txt", "other.txt").await;
+        Arc::get_mut(&mut world.ctx)
+            .unwrap()
+            .config
+            .repo_defaults
+            .preserve_reviewed_content = true;
+        let before = [world.branch("pr-1"), world.branch("pr-2")];
+        *world.agent.damage.lock().unwrap() = Some((path.into(), "damaged\n".into()));
+        let event = rebase_stack(&world).await;
+        assert!(matches!(event, Event::RebaseFailed(_)), "{event:?}");
+        assert_eq!([world.branch("pr-1"), world.branch("pr-2")], before);
+        assert!(world.merged().is_empty());
+    }
 }
 
 #[tokio::test]

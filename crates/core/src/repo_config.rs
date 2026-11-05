@@ -20,6 +20,8 @@ pub struct RepoSettings {
     pub batch_size: usize,
     #[serde(default)]
     pub test_current_main: bool,
+    #[serde(default)]
+    pub preserve_reviewed_content: bool,
     pub agent: AgentSettings,
     /// Run after an agent resolution or fix, before the publish.
     pub verify: Vec<String>,
@@ -203,6 +205,7 @@ struct RepoConfig {
     label: Option<String>,
     batch_size: Option<usize>,
     test_current_main: Option<bool>,
+    preserve_reviewed_content: Option<bool>,
     /// `resolver` is its name from before a task could override its model.
     #[serde(default, alias = "resolver")]
     agent: AgentConfig,
@@ -277,6 +280,8 @@ struct Written<'a> {
     batch_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     test_current_main: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preserve_reviewed_content: Option<bool>,
     #[serde(skip_serializing_if = "WrittenAgent::is_empty")]
     agent: WrittenAgent<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,6 +411,9 @@ impl RepoSettings {
             test_current_main: config
                 .test_current_main
                 .unwrap_or(defaults.test_current_main),
+            preserve_reviewed_content: config
+                .preserve_reviewed_content
+                .unwrap_or(defaults.preserve_reviewed_content),
             agent: AgentSettings {
                 provider,
                 model,
@@ -507,6 +515,9 @@ impl RepoSettings {
             batch_size: (self.batch_size != defaults.batch_size).then_some(self.batch_size),
             test_current_main: (self.test_current_main != defaults.test_current_main)
                 .then_some(self.test_current_main),
+            preserve_reviewed_content: (self.preserve_reviewed_content
+                != defaults.preserve_reviewed_content)
+                .then_some(self.preserve_reviewed_content),
             agent: WrittenAgent {
                 provider: model.then_some(s.provider),
                 model: model.then_some(&s.model),
@@ -572,6 +583,7 @@ mod tests {
             label: "mergepatrol".into(),
             batch_size: 8,
             test_current_main: false,
+            preserve_reviewed_content: false,
             agent: AgentSettings {
                 provider: Provider::Anthropic,
                 model: "claude-opus-5-5".into(),
@@ -651,6 +663,72 @@ mod tests {
         ] {
             assert!(
                 RepoSettings::from_file(Some(yaml), &defaults()).is_err(),
+                "{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewed_content_is_a_repo_only_opt_in_that_survives_rewrites() {
+        let defaults = defaults();
+        for file in [None, Some(""), Some("preserve_reviewed_content: false\n")] {
+            assert!(
+                !RepoSettings::from_file(file, &defaults)
+                    .unwrap()
+                    .preserve_reviewed_content
+            );
+        }
+        let enabled =
+            RepoSettings::from_file(Some("preserve_reviewed_content: true\n"), &defaults).unwrap();
+        let yaml = enabled.to_yaml(&defaults);
+        assert!(yaml.contains("preserve_reviewed_content: true"));
+        assert_eq!(
+            RepoSettings::from_file(Some(&yaml), &defaults).unwrap(),
+            enabled
+        );
+        assert!(
+            RepoSettings::from_file(None, &enabled)
+                .unwrap()
+                .preserve_reviewed_content
+        );
+        let disabled =
+            RepoSettings::from_file(Some("preserve_reviewed_content: false\n"), &enabled).unwrap();
+        assert!(!disabled.preserve_reviewed_content);
+        assert!(
+            disabled
+                .to_yaml(&enabled)
+                .contains("preserve_reviewed_content: false")
+        );
+        assert!(
+            !defaults
+                .to_yaml(&defaults)
+                .contains("preserve_reviewed_content")
+        );
+        let workspace = WorkspaceDefaults::from(enabled);
+        assert!(
+            !serde_json::to_value(&workspace)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("preserve_reviewed_content")
+        );
+        assert!(!workspace.over(&defaults).preserve_reviewed_content);
+        let mut old = serde_json::to_value(&defaults).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("preserve_reviewed_content");
+        assert!(
+            !serde_json::from_value::<RepoSettings>(old)
+                .unwrap()
+                .preserve_reviewed_content
+        );
+        for yaml in [
+            "preserve_reviewed_content: 1\n",
+            "preserve_reviewed_content: 'true'\n",
+            "preserve_reviewed_conent: true\n",
+        ] {
+            assert!(
+                RepoSettings::from_file(Some(yaml), &defaults).is_err(),
                 "{yaml}"
             );
         }

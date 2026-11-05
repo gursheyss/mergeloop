@@ -301,7 +301,7 @@ async fn rebase(
 ) -> Result<()> {
     let mut resolved_any = false;
     let mut step = git
-        .rebase(dir, &spec.trunk_sha, spec.upstream.as_deref())
+        .rebase_reviewed(dir, &spec.trunk_sha, spec.upstream.as_deref())
         .await?;
     while let RebaseStep::Conflict { commit, files } = step {
         event(events, "conflict", files.join(", "));

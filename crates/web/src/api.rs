@@ -662,6 +662,8 @@ pub struct RepoSettingsView {
     pub batch_size: u32,
     #[serde(default)]
     pub test_current_main: bool,
+    #[serde(default)]
+    pub preserve_reviewed_content: bool,
     #[ts(type = "\"anthropic\" | \"openai\" | \"openrouter\"")]
     pub provider: Provider,
     pub model: String,
@@ -739,6 +741,7 @@ impl From<RepoSettings> for RepoSettingsView {
             label: s.label,
             batch_size: s.batch_size as u32,
             test_current_main: s.test_current_main,
+            preserve_reviewed_content: s.preserve_reviewed_content,
             provider: s.agent.provider,
             model: s.agent.model,
             effort: s.agent.effort,
@@ -758,6 +761,7 @@ impl From<RepoSettingsView> for RepoSettings {
             label: v.label.trim().to_owned(),
             batch_size: v.batch_size as usize,
             test_current_main: v.test_current_main,
+            preserve_reviewed_content: v.preserve_reviewed_content,
             agent: AgentSettings {
                 provider: v.provider,
                 model: v.model.trim().to_owned(),
@@ -3307,6 +3311,22 @@ mod tests {
         let view = RepoSettingsView::from(parsed);
         assert_eq!(
             serde_json::to_value(view).unwrap()["test_current_main"],
+            true
+        );
+    }
+
+    #[test]
+    fn reviewed_content_survives_the_api_and_config_roundtrip() {
+        let defaults = settings();
+        assert!(!defaults.preserve_reviewed_content);
+        let mut json = serde_json::to_value(RepoSettingsView::from(defaults.clone())).unwrap();
+        json["preserve_reviewed_content"] = true.into();
+        let enabled = RepoSettings::from(serde_json::from_value::<RepoSettingsView>(json).unwrap());
+        let yaml = enabled.to_yaml(&defaults);
+        let parsed = RepoSettings::from_file(Some(&yaml), &defaults).unwrap();
+        assert!(parsed.preserve_reviewed_content);
+        assert_eq!(
+            serde_json::to_value(RepoSettingsView::from(parsed)).unwrap()["preserve_reviewed_content"],
             true
         );
     }

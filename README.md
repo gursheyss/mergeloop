@@ -209,6 +209,7 @@ version: 1
 label: mergepatrol
 batch_size: 8
 test_current_main: false
+preserve_reviewed_content: false
 agent:                  # the default model, which every task runs unless it overrides it
   provider: anthropic   # or openai
   model: claude-opus-5-5
@@ -245,6 +246,10 @@ The verify commands run after an agent resolution or fix, before the publish.
 `test_current_main` is a repo-only opt-in, off by default. Set it to `true` to disable skipping a lone PR's rebase when its old head is green but behind the target branch. The queue uses its usual rebase and required-check path; it does not merge on the old checks. Batches still share one combined-head CI run. Before each merge or retry, including after a restart, the queue reads the target branch directly and restarts stale work. A batch advances its expected base after each successful merge, so its own progress does not stop the remaining PRs.
 
 This is not an atomic base lock: GitHub's merge API pins the PR head, not the target branch. An outside merge between the final base read and GitHub's merge can still race it. The setting does not change branch protection.
+
+Updates replay the PR's net change from its merge base as one commit, including content committed only inside merge commits. Stack layers replay only their own net change from the old layer below, onto the updated layer below.
+
+`preserve_reviewed_content` is a repo-only opt-in, off by default. Before publishing any clean update, conflict resolution, CI fix or review fix, MergeLoop compares the result with the head from before that operation. Every path the PR changed since its merge base must keep exactly that head's content and file mode unless the target branch also changed the path since that base. A mismatch ejects the PR and lists the paths, without pushing the result. This intentionally rejects even legitimate fixes to those paths; fix the branch yourself and queue it again. Paths both sides changed are left to conflict resolution and checks. The same guard covers every stack layer and fixes after a failed batch; batches themselves combine trees without replaying commits.
 
 A repo that sets none is not left without checks. MergeLoop reads the workflows in `.github/workflows/` that run on a pull request, and gives the agent the commands they run for it: a review makes one of them fail to show that a change is needed, and a fix runs it before the publish. MergeLoop never uses a command it read from CI to eject a PR, only the ones your file declares, so set `verify` to pin what a resolution and a fix must pass. A workflow step that needs the workflow's context, a secret or another host is left out: the job has the toolchains, not your CI's services.
 

@@ -91,6 +91,7 @@ impl Config {
             label: opt("MERGEPATROL_LABEL", "mergepatrol"),
             batch_size: opt("MERGEPATROL_BATCH_SIZE", "8").parse()?,
             test_current_main: false,
+            preserve_reviewed_content: false,
             agent: AgentSettings {
                 provider,
                 model,

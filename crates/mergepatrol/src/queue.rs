@@ -3211,13 +3211,13 @@ async fn fix_and_publish(
     let repo = &key.repo;
     let git = Git;
     let pr = &unit.layers[layer];
-    let (cache, heads) = {
+    let (cache, heads, trunk) = {
         let _cache = ctx.caches.lock(repo).await;
-        let (cache, fetched, _) = fetch_layers(ctx, gh, &git, key, &unit.layers).await?;
+        let (cache, fetched, trunk) = fetch_layers(ctx, gh, &git, key, &unit.layers).await?;
         if fetched[layer] != head {
             return Ok(Event::HeadMoved);
         }
-        (cache, fetched)
+        (cache, fetched, trunk)
     };
     let job_id = format!(
         "{}-{}-{}-fix-{}",
@@ -3241,6 +3241,14 @@ async fn fix_and_publish(
             return anyhow::Ok(Err(Event::HeadMoved));
         }
         let local_head = check_fix_output(&git, &cache, &out, pr.number, head).await?;
+        if settings.preserve_reviewed_content {
+            let onto = match layer {
+                0 => &trunk,
+                _ => &heads[layer - 1],
+            };
+            git.preserve_reviewed_content(&cache, onto, head, &local_head, None)
+                .await?;
+        }
         let published =
             publish_to_pr(gh, &git, &cache, key, snap, pr, head, head, &local_head).await?;
         if let Ok(sha) = &published {
@@ -3352,7 +3360,22 @@ pub(crate) async fn fix_findings(
     let event = sandbox
         .fix_and_restack(key, &snap, unit, layer, settings, head, &base, task, true)
         .await;
-    sandbox.published(key, event).await
+    let event = sandbox.published(key, event).await?;
+    if let Event::FixFailed(reason) = &event
+        && reason.contains(mergepatrol_git::REVIEWED_CONTENT_CHANGED)
+    {
+        eject(
+            ctx,
+            settings,
+            gh,
+            key,
+            &unit.prs(),
+            &format!("Ejected: {reason}."),
+            "reviewed-content-changed",
+        )
+        .await?;
+    }
+    Ok(event)
 }
 
 /// Pushes an empty commit on `head`, on which CI runs anew and reads the PR as it is now. A
@@ -3618,6 +3641,10 @@ async fn rebase_layers(
             upstream.as_deref(),
         )
         .await?;
+        if settings.preserve_reviewed_content {
+            git.preserve_reviewed_content(cache, &onto, head, &local_head, upstream.as_deref())
+                .await?;
+        }
         let publish = Publish {
             repo,
             repo_id: &snap.id,

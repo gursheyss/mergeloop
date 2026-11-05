@@ -1,11 +1,13 @@
 //! Local git, through the `git` CLI. MergeLoop never pushes: `fetch` is the only network call,
 //! and the `github` crate publishes the commits.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use mergepatrol_core::{FIXES_USED, fixes_used};
 use tokio::io::AsyncWriteExt;
 
 /// The longest a fetch may take. A first fetch of a large repo is slow; a stalled one is cut
@@ -14,6 +16,8 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// Committer of the local rebase. The published commits get GitHub's bot identity instead.
 const COMMITTER: (&str, &str) = ("MergeLoop", "mergepatrol@users.noreply.github.com");
+
+pub const REVIEWED_CONTENT_CHANGED: &str = "preserve_reviewed_content:";
 
 #[derive(Clone, Copy, Default)]
 pub struct Git;
@@ -229,11 +233,97 @@ impl Git {
     }
 
     pub async fn changed_files(&self, wt: &Path, from: &str, to: &str) -> Result<Vec<String>> {
-        Ok(lines(
-            &self
-                .run(wt, &["diff", "--name-only", "--no-renames", from, to])
-                .await?,
-        ))
+        Ok(self
+            .run(wt, &["diff", "--name-only", "-z", "--no-renames", from, to])
+            .await?
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    pub async fn preserve_reviewed_content(
+        &self,
+        wt: &Path,
+        onto: &str,
+        reviewed: &str,
+        result: &str,
+        upstream: Option<&str>,
+    ) -> Result<()> {
+        let start = match upstream {
+            Some(start) => start.to_owned(),
+            None => self.merge_base(wt, onto, reviewed).await?,
+        };
+        let touched = self.changed_files(wt, &start, reviewed).await?;
+        let base_changed: BTreeSet<_> = self
+            .changed_files(wt, &start, onto)
+            .await?
+            .into_iter()
+            .collect();
+        let result_changed: BTreeSet<_> = self
+            .changed_files(wt, reviewed, result)
+            .await?
+            .into_iter()
+            .collect();
+        let lost: Vec<String> = touched
+            .into_iter()
+            .filter(|path| !base_changed.contains(path) && result_changed.contains(path))
+            .map(|path| format!("{path:?}"))
+            .collect();
+        if !lost.is_empty() {
+            bail!(
+                "{REVIEWED_CONTENT_CHANGED} the result differs from the reviewed head in paths the base did not change: {}",
+                lost.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn rebase_reviewed(
+        &self,
+        wt: &Path,
+        onto: &str,
+        upstream: Option<&str>,
+    ) -> Result<RebaseStep> {
+        let head = self.rev_parse(wt, "HEAD").await?;
+        let start = match upstream {
+            Some(start) => start.to_owned(),
+            None => self.merge_base(wt, onto, &head).await?,
+        };
+        if self.is_ancestor(wt, onto, &head).await? {
+            return Ok(RebaseStep::Done);
+        }
+        let messages = self
+            .run(wt, &["log", "-20", "--format=%B%x00", &head])
+            .await?;
+        let used = fixes_used(messages.split('\0').map(str::trim));
+        let trailer = format!("{FIXES_USED} {used}");
+        let range = format!("{start}..{head}");
+        let authors = self
+            .run(
+                wt,
+                &["log", "--format=Co-authored-by: %an <%ae>%n%B", &range],
+            )
+            .await?;
+        let authors: BTreeSet<_> = authors
+            .lines()
+            .filter(|line| line.starts_with("Co-authored-by: "))
+            .collect();
+        self.run(wt, &["reset", "--soft", &start]).await?;
+        let mut args = vec![
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-C",
+            &head,
+            "--trailer",
+            &trailer,
+        ];
+        for author in authors {
+            args.extend(["--trailer", author]);
+        }
+        self.run(wt, &args).await?;
+        self.rebase(wt, onto, Some(&start)).await
     }
 
     /// Rebases HEAD onto `onto`: the commits from `upstream`, or those not on `onto` when
