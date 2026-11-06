@@ -76,6 +76,8 @@ struct State {
     /// whether they are resolved.
     threads: Vec<(String, Vec<String>, bool)>,
     merges: u32,
+    /// Each merge asked for, and whether it was a stack's, which keeps GitHub's wording.
+    merge_requests: Vec<(PrNumber, bool)>,
     /// Merged PRs stay, closed, as on GitHub.
     merged: Vec<PrNumber>,
     /// Trees by commit, as the PRs merged into them in order: `t-1-2`. Unknown commits are `t`.
@@ -502,7 +504,9 @@ impl GitHub for Fake {
         number: PrNumber,
         sha: &str,
         method: &str,
+        stacked: bool,
     ) -> Result<MergeOutcome> {
+        self.with_mut(|s| s.merge_requests.push((number, stacked)));
         let hang = self.with_mut(|s| {
             if s.merge_hangs_at.is_none_or(|at| at == number) {
                 s.merge_hangs.take()
@@ -2230,6 +2234,30 @@ async fn a_green_stack_goes_on_from_getting_ready_and_merges_at_once() {
     run.tick().await;
     assert!(run.ctx.prep.asked().is_empty());
     assert_eq!(run.merged(), [1, 2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lone_or_batched_pr_is_merged_in_its_own_words_and_a_stack_in_githubs() {
+    let lone = Run::new(Fake::new(|s| s.add_pr(1)));
+    lone.tick().await;
+    assert_eq!(lone.gh.with(|s| s.merge_requests.clone()), [(1, false)]);
+
+    let batch = Run::batching_on_the_lane(Fake::new(prs(&[1, 2])));
+    batch.tick().await;
+    assert_eq!(batch.merged(), [1, 2]);
+    assert_eq!(
+        batch.gh.with(|s| s.merge_requests.clone()),
+        [(1, false), (2, false)]
+    );
+
+    let stack = prep_run(|s| {
+        s.add_stack(10, &[1, 2], &[2]);
+        s.required = vec!["ci".into()];
+        s.checks.insert("ci".into(), CheckState::Passed);
+    });
+    stack.tick().await;
+    assert_eq!(stack.merged(), [1, 2]);
+    assert_eq!(stack.gh.with(|s| s.merge_requests.clone()), [(2, true)]);
 }
 
 #[tokio::test(start_paused = true)]

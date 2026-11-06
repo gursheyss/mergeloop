@@ -1833,17 +1833,22 @@ async fn resume_merge(
     method: &str,
 ) -> Result<bool> {
     let repo = &key.repo;
-    let open = units.iter().any(|u| {
+    let open = units.iter().find(|u| {
         u.number == merge.number
             && u.top().number == merge.top
             && u.top().head_ref_oid == merge.head
             && u.hold_reason().is_none()
     });
-    let current = !open
+    let current = open.is_none()
         || !settings.test_current_main
         || merge.base.as_deref() == Some(gh.live_branch_sha(repo, &key.trunk).await?.as_str());
-    let sha = if open && current {
-        match gh.merge(repo, merge.top, &merge.head, method).await? {
+    let sha = if let Some(unit) = open
+        && current
+    {
+        match gh
+            .merge(repo, merge.top, &merge.head, method, unit.stacked)
+            .await?
+        {
             MergeOutcome::Merged { sha } => Some(sha),
             MergeOutcome::Rejected(_) => None,
         }
@@ -2221,7 +2226,7 @@ async fn merge_batch(
         let method = merge_method(gh, key, snap).await?;
         let base = settings.test_current_main.then_some(expected_base.as_str());
         start_merge(ctx, key, lane, tested, &top.head_ref_oid, base).await?;
-        match merge_retrying(gh, key, top.number, &top.head_ref_oid, &method, base).await? {
+        match merge_retrying(gh, key, tested, &top.head_ref_oid, &method, base).await? {
             Some(MergeOutcome::Merged { sha }) => {
                 let tree = gh.commit_tree(repo, &sha).await?;
                 let merged = Outcome::Merged(sha.clone());
@@ -2355,7 +2360,7 @@ impl Unreported {
 async fn merge_retrying(
     gh: &dyn GitHub,
     key: &LaneKey,
-    number: PrNumber,
+    unit: &Unit,
     head: &str,
     method: &str,
     base: Option<&str>,
@@ -2367,7 +2372,10 @@ async fn merge_retrying(
         {
             return Ok(None);
         }
-        match gh.merge(&key.repo, number, head, method).await? {
+        match gh
+            .merge(&key.repo, unit.top().number, head, method, unit.stacked)
+            .await?
+        {
             MergeOutcome::Rejected(_) if tries < MERGE_RETRIES => {
                 tries += 1;
                 tokio::time::sleep(MERGE_RETRY_AFTER).await;
@@ -2753,7 +2761,7 @@ async fn run_job(
                         record_all(ctx, key, &prs, "base-moved", why).await?;
                         break 'merging Event::BaseMoved;
                     }
-                    match gh.merge(repo, top, head, &method).await? {
+                    match gh.merge(repo, top, head, &method, now.stacked).await? {
                         MergeOutcome::Merged { sha } => return Ok(Outcome::Merged(sha)),
                         MergeOutcome::Rejected(r) => {
                             lane.merging = None;

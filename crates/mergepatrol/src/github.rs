@@ -49,6 +49,7 @@ pub trait GitHub: Send + Sync {
         number: PrNumber,
         sha: &str,
         method: &str,
+        stacked: bool,
     ) -> Result<MergeOutcome>;
     /// The merge commit of the PR, if it merged at `head`.
     async fn merged_as(
@@ -142,8 +143,9 @@ impl GitHub for Installation {
         number: PrNumber,
         sha: &str,
         method: &str,
+        stacked: bool,
     ) -> Result<MergeOutcome> {
-        Installation::merge(self, repo, number, sha, method).await
+        Installation::merge(self, repo, number, sha, method, stacked).await
     }
     async fn merged_as(
         &self,

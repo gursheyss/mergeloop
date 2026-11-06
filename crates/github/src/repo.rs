@@ -325,6 +325,47 @@ pub enum MergeOutcome {
 /// How often to ask for the result of an asynchronous merge. A stack of three took 10 seconds.
 const MERGE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// A PR's squash commit: `Title (#number)`, as GitHub numbers one, then the description and,
+/// each once, the co-authors its commits credit.
+fn squash_message(number: PrNumber, pr: &Value, commits: &[Value]) -> (String, String) {
+    let title = format!(
+        "{} (#{number})",
+        pr["title"].as_str().unwrap_or_default().trim()
+    );
+    let author = pr["user"]["login"].as_str();
+    let mut credits: Vec<String> = Vec::new();
+    for c in commits {
+        let commit = &c["commit"];
+        if c["author"]["login"].as_str() != author
+            && let (Some(name), Some(email)) = (
+                commit["author"]["name"].as_str(),
+                commit["author"]["email"].as_str(),
+            )
+        {
+            credits.push(format!("Co-authored-by: {name} <{email}>"));
+        }
+        credits.extend(
+            commit["message"]
+                .as_str()
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with("Co-authored-by: "))
+                .map(str::to_owned),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    credits.retain(|line| seen.insert(line.clone()));
+    let body = [
+        pr["body"].as_str().unwrap_or_default().trim(),
+        &credits.join("\n"),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    (title, body)
+}
+
 /// GitHub's reason for not merging, from an error body or a failed result, without its full stop:
 /// the ejection's sentence ends with one.
 fn rejection(body: &Value) -> String {
@@ -1204,18 +1245,41 @@ impl Installation {
     /// PR: for one, it merges every layer up to `number`, or none. Waits for the result. A merge
     /// already pending for the PR, from before a restart, is waited for rather than requested
     /// again.
+    ///
+    /// A squash is worded as the PR is: its title and number, then its description. Left to
+    /// GitHub, a repo that words a lone commit's squash by its message would take whatever the
+    /// PR's last commit says, and an update leaves the PR one commit. A stack keeps GitHub's
+    /// wording, since one merge lands every layer.
     pub async fn merge(
         &self,
         repo: &RepoName,
         number: PrNumber,
         sha: &str,
         method: &str,
+        stacked: bool,
     ) -> Result<MergeOutcome> {
+        let mut request =
+            json!({ "sha": sha, "merge_method": method, "merge_action": "direct_merge" });
+        if method == "squash" && !stacked {
+            let pr: Value = self
+                .rest(Method::GET, &format!("/repos/{repo}/pulls/{number}"), None)
+                .await?;
+            let commits: Vec<Value> = self
+                .rest(
+                    Method::GET,
+                    &format!("/repos/{repo}/pulls/{number}/commits?per_page=100"),
+                    None,
+                )
+                .await?;
+            let (title, body) = squash_message(number, &pr, &commits);
+            request["commit_title"] = title.into();
+            request["commit_message"] = body.into();
+        }
         let res = self
             .request(
                 Method::PUT,
                 &format!("/repos/{repo}/pulls/{number}/merge-async"),
-                Some(json!({ "sha": sha, "merge_method": method, "merge_action": "direct_merge" })),
+                Some(request),
             )
             .await;
         // A merge can go through though its reply says otherwise: lost in a 502, or a retry that
@@ -1888,9 +1952,81 @@ mod tests {
     async fn merge_answered(pr: &'static str) -> (MergeOutcome, Vec<String>) {
         let (gh, requests) = fake::serve(vec![(405, "", NOT_MERGEABLE), (200, "", pr)]).await;
         let repo = RepoName::parse("o/r").unwrap();
-        let outcome = gh.merge(&repo, 7, "abc", "squash").await.unwrap();
+        let outcome = gh.merge(&repo, 7, "abc", "merge", false).await.unwrap();
         let requests = requests.lock().unwrap().clone();
         (outcome, requests)
+    }
+
+    /// arnold#1280: titled for its change, its one commit says "chore: trigger review", which
+    /// GitHub took for the squash's subject.
+    #[tokio::test]
+    async fn a_squash_takes_the_prs_title_and_body_not_its_last_commits_message() {
+        let pr = json!({
+            "number": 1280,
+            "title": "refactor(kernel): run every command runner on the kernel runtime",
+            "body": "## Summary\n\nRunners return the kernel's requirements.\n",
+            "user": { "login": "gursheyss" },
+        });
+        let commits = json!([
+            {
+                "author": { "login": "gursheyss" },
+                "commit": {
+                    "author": { "name": "gursheyss", "email": "g@example.com" },
+                    "message": "refactor(kernel): run every command runner on the kernel runtime\n\nCo-authored-by: capy-ai[bot] <capy@example.com>",
+                },
+            },
+            {
+                "author": { "login": "mergeloop[bot]" },
+                "commit": {
+                    "author": { "name": "mergeloop[bot]", "email": "ml@example.com" },
+                    "message": "chore: trigger review\n\nMergeLoop-fixes-used: 0\n\nCo-authored-by: capy-ai[bot] <capy@example.com>",
+                },
+            },
+        ]);
+        let merged = r#"{"status":"merged","details":{"sha":"m1"}}"#;
+        let (gh, requests) = fake::serve_whole(vec![
+            (200, "", leak(pr.to_string())),
+            (200, "", leak(commits.to_string())),
+            (200, "", merged),
+        ])
+        .await;
+        let repo = RepoName::parse("o/r").unwrap();
+        let outcome = gh.merge(&repo, 1280, "abc", "squash", false).await.unwrap();
+        assert!(matches!(&outcome, MergeOutcome::Merged { sha } if sha == "m1"));
+
+        let requests = requests.lock().unwrap().clone();
+        assert!(requests[0].starts_with("GET /repos/o/r/pulls/1280 HTTP/1.1"));
+        assert!(requests[1].starts_with("GET /repos/o/r/pulls/1280/commits?per_page=100 HTTP/1.1"));
+        assert!(requests[2].starts_with("PUT /repos/o/r/pulls/1280/merge-async HTTP/1.1"));
+        let sent: Value =
+            serde_json::from_str(requests[2].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            sent["commit_title"],
+            "refactor(kernel): run every command runner on the kernel runtime (#1280)"
+        );
+        assert_eq!(
+            sent["commit_message"],
+            "## Summary\n\nRunners return the kernel's requirements.\n\n\
+             Co-authored-by: capy-ai[bot] <capy@example.com>\n\
+             Co-authored-by: mergeloop[bot] <ml@example.com>"
+        );
+        assert_eq!(sent["merge_method"], "squash");
+    }
+
+    #[tokio::test]
+    async fn a_stack_or_a_merge_commit_keeps_githubs_wording() {
+        for (method, stacked) in [("squash", true), ("merge", false), ("rebase", false)] {
+            let merged = r#"{"status":"merged","details":{"sha":"m1"}}"#;
+            let (gh, requests) = fake::serve_whole(vec![(200, "", merged)]).await;
+            let repo = RepoName::parse("o/r").unwrap();
+            gh.merge(&repo, 7, "abc", method, stacked).await.unwrap();
+            let requests = requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 1, "{method}");
+            let sent: Value =
+                serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert!(sent.get("commit_title").is_none(), "{method}");
+            assert!(sent.get("commit_message").is_none(), "{method}");
+        }
     }
 
     #[tokio::test]

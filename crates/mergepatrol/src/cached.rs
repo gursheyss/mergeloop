@@ -364,8 +364,9 @@ impl GitHub for Cached<'_> {
         number: PrNumber,
         sha: &str,
         method: &str,
+        stacked: bool,
     ) -> Result<MergeOutcome> {
-        let merged = GitHub::merge(self.gh, repo, number, sha, method).await;
+        let merged = GitHub::merge(self.gh, repo, number, sha, method, stacked).await;
         let changed = vec![
             Change::Pr(number),
             Change::Repo,
