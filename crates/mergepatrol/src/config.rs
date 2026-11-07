@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use mergepatrol_billing::StripeConfig;
 use mergepatrol_core::{AgentSettings, Provider, RepoSettings};
+use mergepatrol_executor::job_files::JobFile;
 
 /// Settings from the environment. Everything else is set up in the dashboard, or in each repo's
 /// config file.
@@ -52,6 +53,8 @@ pub enum ExecutorConfig {
         resolv_conf: Option<String>,
         memory: String,
         cpus: String,
+        /// `MERGEPATROL_JOB_FILES`: what the jobs of each repo get, such as a registry's `.npmrc`.
+        files: Vec<JobFile>,
     },
     /// A GKE sandbox per job, claimed from an Agent Sandbox warm pool, which reaches back to
     /// `job_proxy_url`. The orchestrator runs in the same cluster.
@@ -107,6 +110,11 @@ impl Config {
             anyhow::anyhow!("MERGEPATROL_LABEL, _BATCH_SIZE, _PROVIDER, _MODEL or _EFFORT: {e}")
         })?;
         let public_url = opt("MERGEPATROL_PUBLIC_URL", "http://localhost:8080");
+        let executor = opt("MERGEPATROL_EXECUTOR", "local");
+        let job_files = var("MERGEPATROL_JOB_FILES");
+        if job_files.is_some() && executor != "docker" {
+            bail!("MERGEPATROL_JOB_FILES: only the docker executor gives jobs files");
+        }
         Ok(Self {
             secret_key,
             database_url: req("MERGEPATROL_DATABASE_URL")?,
@@ -123,7 +131,7 @@ impl Config {
             bind: opt("MERGEPATROL_BIND", "127.0.0.1:8080").parse()?,
             max_jobs: opt("MERGEPATROL_MAX_JOBS", "4").parse()?,
             prep: opt("MERGEPATROL_PREP", "true").parse()?,
-            executor: match opt("MERGEPATROL_EXECUTOR", "local").as_str() {
+            executor: match executor.as_str() {
                 "local" => ExecutorConfig::Local,
                 "docker" => ExecutorConfig::Docker {
                     image: opt("MERGEPATROL_JOB_IMAGE", "mergepatrol-job:latest"),
@@ -132,6 +140,12 @@ impl Config {
                     resolv_conf: var("MERGEPATROL_JOB_RESOLV_CONF"),
                     memory: opt("MERGEPATROL_JOB_MEMORY", "4g"),
                     cpus: opt("MERGEPATROL_JOB_CPUS", "2"),
+                    files: job_files
+                        .as_deref()
+                        .map(JobFile::parse_list)
+                        .transpose()
+                        .context("MERGEPATROL_JOB_FILES")?
+                        .unwrap_or_default(),
                 },
                 "agent-sandbox" => ExecutorConfig::AgentSandbox {
                     namespace: opt("MERGEPATROL_SANDBOX_NAMESPACE", "mergepatrol-jobs"),

@@ -3,6 +3,7 @@
 //! runs the job as a subprocess, for development. `RemoteExecutor` runs each job on another
 //! machine: a GKE sandbox, through `sandbox::SandboxLaunch`.
 
+pub mod job_files;
 pub mod protocol;
 pub mod proxy;
 pub mod remote;
@@ -12,11 +13,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::job_files::JobFile;
 use crate::protocol::{JobResult, JobSpec, RESULT_FILE};
 
 #[async_trait]
@@ -42,9 +44,10 @@ impl Executor for LocalExecutor {
     }
 }
 
-/// One container per job: `docker create`, `docker start` with the spec on stdin, then
-/// `docker cp` the output out. The only bind mount is `resolv_conf`, a host file, so it also
-/// works when the orchestrator itself runs in a container and talks to the host's Docker.
+/// One container per job: `docker create`, `docker cp` its repo's job files in, `docker start`
+/// with the spec on stdin, then `docker cp` the output out. The only bind mount is `resolv_conf`,
+/// a host file, so it also works when the orchestrator itself runs in a container and talks to
+/// the host's Docker.
 pub struct DockerExecutor {
     pub image: String,
     /// `runsc` for gVisor. `None` uses Docker's default runtime.
@@ -58,11 +61,33 @@ pub struct DockerExecutor {
     pub memory: String,
     pub cpus: String,
     pub timeout: Duration,
+    /// Streamed into the jobs of their repos, and masked in what those jobs leave behind.
+    pub files: Vec<JobFile>,
 }
 
 #[async_trait]
 impl Executor for DockerExecutor {
     async fn run(&self, job_id: &str, spec: &JobSpec, out: &Path) -> Result<JobResult> {
+        let files = job_files::read_for(&self.files, &spec.repo).await?;
+        let secrets = job_files::secrets(&files);
+        let ran = self.run_container(job_id, spec, out, &files).await;
+        job_files::mask_dir(out, &secrets).await?;
+        match ran {
+            Ok(logs) => read_result(out, &job_files::mask(&logs, &secrets)).await,
+            Err(e) => Err(anyhow!("{}", job_files::mask(&format!("{e:#}"), &secrets))),
+        }
+    }
+}
+
+impl DockerExecutor {
+    /// Returns the end of the job's log.
+    async fn run_container(
+        &self,
+        job_id: &str,
+        spec: &JobSpec,
+        out: &Path,
+        files: &[(String, Vec<u8>)],
+    ) -> Result<String> {
         tokio::fs::create_dir_all(out).await?;
         let name = format!("mergepatrol-job-{job_id}");
         // A container left over from a crash would block the name.
@@ -102,13 +127,20 @@ impl Executor for DockerExecutor {
             .trim()
             .to_owned();
 
+        if !files.is_empty() {
+            let mut cp = Command::new("docker");
+            // `-a` keeps the archive's owner, the job's user.
+            cp.args(["cp", "-a", "-", &format!("{id}:/")]);
+            checked_with_input(cp, "docker cp the job files", job_files::archive(files)).await?;
+        }
+
         let mut start = Command::new("docker");
         start.args(["start", "-a", "-i", &id]);
         let logs = run_with_spec(start, spec, self.timeout).await?;
         let mut cp = Command::new("docker");
         cp.args(["cp", &format!("{id}:/out/."), path_str(out)?]);
         checked(cp, "docker cp").await?;
-        read_result(out, &logs).await
+        Ok(logs)
     }
 }
 
@@ -177,6 +209,30 @@ async fn checked_within(mut cmd: Command, what: &str, timeout: Duration) -> Resu
         .await
         .with_context(|| format!("{what}: no result after {timeout:?}"))?
         .with_context(|| format!("{what}: spawn"))?;
+    succeeded(out, what)
+}
+
+async fn checked_with_input(mut cmd: Command, what: &str, input: Vec<u8>) -> Result<Vec<u8>> {
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("{what}: spawn"))?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let fed = async move {
+        stdin.write_all(&input).await?;
+        drop(stdin);
+        child.wait_with_output().await
+    };
+    let out = tokio::time::timeout(DOCKER_TIMEOUT, fed)
+        .await
+        .with_context(|| format!("{what}: no result after {DOCKER_TIMEOUT:?}"))??;
+    succeeded(out, what)
+}
+
+fn succeeded(out: std::process::Output, what: &str) -> Result<Vec<u8>> {
     if !out.status.success() {
         bail!("{what}: {}", String::from_utf8_lossy(&out.stderr).trim());
     }

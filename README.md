@@ -426,6 +426,7 @@ In production the job containers use gVisor (`runsc`) on a network that cannot r
 | `MERGEPATROL_JOB_PROXY_BIND` | None | A second listener that serves only what jobs use, for jobs that cannot reach the dashboard's. `0.0.0.0:8081` in `compose.yml` |
 | `MERGEPATROL_JOB_MEMORY` | `4g` | Memory limit per job |
 | `MERGEPATROL_JOB_CPUS` | `2` | CPU limit per job |
+| `MERGEPATROL_JOB_FILES` | none | Files for one repo's jobs, such as an `.npmrc` with a registry token: `owner/name:<source>:<target>`, comma-separated. The orchestrator reads `source` for each job and copies it to `target` before the job starts, owned by the job's user with mode 0400. Each line's value (after its first `=`) is replaced by `***` in the job's transcripts, result, log and errors, but not in its bundle. The job's agent can read the file and has the network, so give a job only what you would give its agent. Docker executor only |
 
 The job image has git, the Claude and Codex CLIs, Rust, Go, Python with uv, and Node with pnpm and Bun, for the verify commands and for the agent, which regenerates a generated file that conflicts with the repo's own tools.
 

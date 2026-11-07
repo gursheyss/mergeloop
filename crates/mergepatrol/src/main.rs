@@ -133,8 +133,12 @@ async fn orchestrator() -> Result<()> {
             resolv_conf,
             memory,
             cpus,
+            files,
         } => {
             tracing::info!(%image, runtime = ?runtime, network = ?network, "jobs run in containers");
+            for file in files {
+                tracing::info!(repo = %file.repo, target = %file.target, "its jobs get a file");
+            }
             Arc::new(DockerExecutor {
                 image: image.clone(),
                 runtime: runtime.clone(),
@@ -143,6 +147,7 @@ async fn orchestrator() -> Result<()> {
                 memory: memory.clone(),
                 cpus: cpus.clone(),
                 timeout: JOB_TIMEOUT,
+                files: files.clone(),
             })
         }
         ExecutorConfig::AgentSandbox {

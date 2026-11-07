@@ -1,12 +1,12 @@
 //! Runs the real `mergepatrol job` binary through `LocalExecutor`, against local git repos.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use mergepatrol_core::{CheckFailure, Provider};
 use mergepatrol_executor::protocol::{
-    ANSWER_FILE, ApiAccess, BUNDLE_FILE, JobOutcome, JobSpec, REVIEW_FILE, ResolverSpec,
+    ANSWER_FILE, ApiAccess, BUNDLE_FILE, JobOutcome, JobResult, JobSpec, REVIEW_FILE, ResolverSpec,
     ReviewOutput, Task,
 };
 use mergepatrol_executor::{Executor, LocalExecutor};
@@ -951,6 +951,7 @@ async fn docker_executor_runs_a_job_in_a_container() {
         memory: "1g".into(),
         cpus: "1".into(),
         timeout: Duration::from_secs(120),
+        files: Vec::new(),
     };
     let out = tmp.path().join("out");
     let result = docker.run("test", &spec, &out).await;
@@ -960,6 +961,160 @@ async fn docker_executor_runs_a_job_in_a_container() {
     let result = result.unwrap();
     assert_eq!(result.outcome, JobOutcome::Done, "{result:?}");
     assert!(out.join(BUNDLE_FILE).exists());
+}
+
+/// A fix in a container from the job image, whose agent prints its repo's job file: the file is
+/// there, the job user's and read-only, and what the job leaves has its value masked. Another
+/// repo's job has no such file. Needs Docker, the job image and `git daemon`, like the test above.
+/// `MERGEPATROL_TEST_JOB_IMAGE` (`mergepatrol-job:latest`), `MERGEPATROL_TEST_JOB_RUNTIME` (`runsc`,
+/// say) and `MERGEPATROL_TEST_JOB_FILE` (a real file, never printed) are optional.
+/// `cargo test -p mergepatrol --test job -- --ignored a_job_file`
+#[tokio::test]
+#[ignore]
+async fn a_job_file_reaches_only_its_repos_jobs_and_never_leaves_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    let (head, trunk) = remote(&origin, "feature.txt", "other.txt");
+    let source = match std::env::var("MERGEPATROL_TEST_JOB_FILE") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            let path = tmp.path().join("npmrc");
+            std::fs::write(
+                &path,
+                "//npm.pkg.github.com/:_authToken=ghp_notarealtoken0123456789\n",
+            )
+            .unwrap();
+            path
+        }
+    };
+    let contents = std::fs::read_to_string(&source).unwrap();
+    let value = contents.trim().split_once('=').unwrap().1.to_owned();
+
+    // The agent: a `claude` that gives up with what it saw of the file.
+    let image = std::env::var("MERGEPATROL_TEST_JOB_IMAGE")
+        .unwrap_or_else(|_| "mergepatrol-job:latest".into());
+    let context = tmp.path().join("image");
+    std::fs::create_dir(&context).unwrap();
+    std::fs::write(
+        context.join("claude"),
+        r#"#!/bin/sh
+f=/home/node/.npmrc
+if [ -e "$f" ]; then seen="$(ls -ln "$f" | cut -d' ' -f1-4) $(tr -d '\n' < "$f")"; else seen=absent; fi
+echo "$seen"
+echo '{"type":"assistant"}'
+printf '{"type":"result","result":"MERGEPATROL_GIVE_UP: %s","total_cost_usd":0.12}\n' "$seen"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        context.join("Dockerfile"),
+        format!("FROM {image}\nCOPY --chmod=755 claude /usr/local/bin/claude\n"),
+    )
+    .unwrap();
+    let tag = "mergepatrol-job-test-job-files";
+    let built = Command::new("docker")
+        .args(["build", "-q", "-t", tag])
+        .arg(&context)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let port = std::net::TcpListener::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let exec_path = git(tmp.path(), &["--exec-path"]);
+    let mut daemon = Command::new(Path::new(&exec_path).join("git-daemon"))
+        .args(["--export-all", "--reuseaddr", "--listen=0.0.0.0"])
+        .arg(format!("--port={port}"))
+        .arg(format!(
+            "--base-path={}",
+            tmp.path().canonicalize().unwrap().display()
+        ))
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let docker = mergepatrol_executor::DockerExecutor {
+        image: tag.into(),
+        runtime: std::env::var("MERGEPATROL_TEST_JOB_RUNTIME").ok(),
+        network: None,
+        resolv_conf: None,
+        memory: "1g".into(),
+        cpus: "1".into(),
+        timeout: Duration::from_secs(120),
+        files: vec![mergepatrol_executor::job_files::JobFile {
+            repo: "o/r".into(),
+            source,
+            target: "/home/node/.npmrc".into(),
+        }],
+    };
+    let mut spec = spec(&origin, &head, &trunk);
+    spec.clone_url = format!("git://host.docker.internal:{port}/origin");
+    spec.resolver.api = Some(ApiAccess {
+        base_url: "http://127.0.0.1:9".into(),
+        token: "job-token".into(),
+    });
+    spec.task = Task::FixChecks {
+        failures: vec![CheckFailure {
+            name: "ci".into(),
+            details: "it broke".into(),
+        }],
+    };
+    let out = tmp.path().join("out");
+    let ours = docker.run("job-files", &spec, &out).await;
+    spec.repo = "o/other".into();
+    let theirs_out = tmp.path().join("theirs");
+    let theirs = docker.run("job-files-other", &spec, &theirs_out).await;
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+
+    let reason = |result: Result<JobResult, anyhow::Error>| match result.unwrap().outcome {
+        JobOutcome::Failed { reason } => reason,
+        JobOutcome::Done => panic!("the fake agent gives up"),
+    };
+    let ours = reason(ours);
+    assert!(
+        !ours.contains(&value),
+        "the job file's value is in the result"
+    );
+    assert!(
+        ours.contains("-r-------- 1 1000 1000 //npm.pkg.github.com/:_authToken=***"),
+        "the job saw no read-only file of its user's"
+    );
+    let mut left = Vec::new();
+    let mut dirs = vec![out.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                left.push(path);
+            }
+        }
+    }
+    let mut masked = 0;
+    for path in left {
+        let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        assert!(
+            !text.contains(&value),
+            "the job file's value is in {}",
+            path.display()
+        );
+        masked += usize::from(text.contains("_authToken=***"));
+    }
+    assert!(masked >= 2, "the result and the transcript show the mask");
+    assert!(
+        reason(theirs).ends_with("gave up: absent"),
+        "another repo's job has the file"
+    );
 }
 
 /// A job that is cut off (its queue stopped) leaves no container or volume behind.
@@ -979,6 +1134,7 @@ async fn a_cut_off_docker_job_leaves_no_container() {
         memory: "1g".into(),
         cpus: "1".into(),
         timeout: Duration::from_secs(120),
+        files: Vec::new(),
     };
     let out = tmp.path().join("out");
     let name = "name=^mergepatrol-job-cut-off$";
