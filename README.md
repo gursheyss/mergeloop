@@ -241,7 +241,7 @@ The agent runs Claude Code for Anthropic's models, and Codex for OpenAI's, with 
 
 The agent has three tasks: resolving a rebase's conflicts, fixing failed checks, and reviewing. Each runs the default model unless `agent.overrides` gives it its own. A task that sets another provider than the default's must set its model too. The dashboard offers each provider's current models by name; the file takes the model's API id, and may name any model the provider serves. A file that still says `resolver:`, the section's old name, reads as `agent:`.
 
-The verify commands run after an agent resolution or fix, before the publish.
+The verify commands run after an agent resolution or fix, before the publish. Once a repo sets them, they are its whole local check. A conflict resolution runs with pnpm and npm offline: it installs nothing, runs none of the repo's other checks, merges a generated file in conflict by hand, and gives up on one only its generator can rebuild. A fix reproduces its failure with the narrowest command that covers it. CI tests the rest once the result is published.
 
 `test_current_main` is a repo-only opt-in, off by default. Set it to `true` to disable skipping a lone PR's rebase when its old head is green but behind the target branch. The queue uses its usual rebase and required-check path; it does not merge on the old checks. Batches still share one combined-head CI run. Before each merge or retry, including after a restart, the queue reads the target branch directly and restarts stale work. A batch advances its expected base after each successful merge, so its own progress does not stop the remaining PRs.
 

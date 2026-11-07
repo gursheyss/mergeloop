@@ -31,7 +31,12 @@ pub struct CodexResolver {
 }
 
 impl CodexResolver {
-    fn command(&self, workdir: &Path, prompt: String) -> Result<tokio::process::Command> {
+    fn command(
+        &self,
+        workdir: &Path,
+        prompt: String,
+        offline: bool,
+    ) -> Result<tokio::process::Command> {
         let key = self.api_key.clone().with_context(|| {
             format!(
                 "no {} API key: add one in the dashboard settings",
@@ -42,6 +47,9 @@ impl CodexResolver {
         let mut cmd = tokio::process::Command::new("codex");
         cmd.current_dir(workdir).env(KEY_VAR, key);
         cli::bypass_proxy(&mut cmd, &self.base_url);
+        if offline {
+            cli::offline(&mut cmd);
+        }
         cmd.args(["exec", "--json", "--ephemeral", "--ignore-user-config"])
             // The job's container is the sandbox, and Codex's own does not run inside gVisor.
             // Nothing asks for approval: there is nobody to answer.
@@ -69,8 +77,14 @@ impl CodexResolver {
         Ok(cmd)
     }
 
-    async fn run(&self, workdir: &Path, prompt: String, transcript: &Path) -> Result<Resolution> {
-        let cmd = self.command(workdir, prompt)?;
+    async fn run(
+        &self,
+        workdir: &Path,
+        prompt: String,
+        transcript: &Path,
+        offline: bool,
+    ) -> Result<Resolution> {
+        let cmd = self.command(workdir, prompt, offline)?;
         let mut run = Run::default();
         let ended = cli::stream(cmd, "codex", self.timeout, transcript, |event| {
             run.on(event, self.max_turns)
@@ -160,21 +174,23 @@ impl Resolver for CodexResolver {
     }
 
     async fn resolve(&self, req: ResolveRequest<'_>) -> Result<Resolution> {
-        self.run(req.workdir, prompt(&req), req.transcript).await
+        let offline = req.verify.pinned();
+        self.run(req.workdir, prompt(&req), req.transcript, offline)
+            .await
     }
 
     async fn fix(&self, req: FixRequest<'_>) -> Result<Resolution> {
-        self.run(req.workdir, fix_prompt(&req), req.transcript)
+        self.run(req.workdir, fix_prompt(&req), req.transcript, false)
             .await
     }
 
     async fn review(&self, req: ReviewRequest<'_>) -> Result<Resolution> {
-        self.run(req.workdir, review_prompt(&req), req.transcript)
+        self.run(req.workdir, review_prompt(&req), req.transcript, false)
             .await
     }
 
     async fn question(&self, req: QuestionRequest<'_>) -> Result<Resolution> {
-        self.run(req.workdir, question_prompt(&req), req.transcript)
+        self.run(req.workdir, question_prompt(&req), req.transcript, false)
             .await
     }
 }
@@ -200,7 +216,9 @@ mod tests {
 
     #[test]
     fn codex_calls_the_api_at_the_base_url_with_the_token() {
-        let cmd = resolver().command(Path::new("."), "p".into()).unwrap();
+        let cmd = resolver()
+            .command(Path::new("."), "p".into(), false)
+            .unwrap();
         let cmd = cmd.as_std();
         let env = cmd
             .get_envs()
@@ -228,10 +246,24 @@ mod tests {
     }
 
     #[test]
+    fn only_an_offline_run_keeps_package_managers_off_the_network() {
+        let offline = |on: bool| {
+            let cmd = resolver().command(Path::new("."), "p".into(), on).unwrap();
+            cmd.as_std()
+                .get_envs()
+                .filter(|(k, _)| *k == "pnpm_config_offline" || *k == "npm_config_offline")
+                .filter_map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offline(true), ["true", "true"]);
+        assert!(offline(false).is_empty());
+    }
+
+    #[test]
     fn no_key_says_whose() {
         let mut r = resolver();
         r.api_key = None;
-        let err = r.command(Path::new("."), "p".into()).unwrap_err();
+        let err = r.command(Path::new("."), "p".into(), false).unwrap_err();
         assert!(err.to_string().contains("no OpenAI API key"), "{err}");
     }
 

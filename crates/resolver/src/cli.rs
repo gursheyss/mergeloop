@@ -25,6 +25,13 @@ pub(crate) fn bypass_proxy(cmd: &mut Command, url: &str) {
     cmd.env("NO_PROXY", &hosts).env("no_proxy", hosts);
 }
 
+/// Keeps the agent's package managers off the network: pnpm and npm refuse to install. A
+/// resolution checked by pinned verify commands needs no dependencies, and CI tests the rest.
+pub(crate) fn offline(cmd: &mut Command) {
+    cmd.env("pnpm_config_offline", "true")
+        .env("npm_config_offline", "true");
+}
+
 /// How a CLI run ended, once it started.
 pub(crate) enum Ended {
     /// The CLI exited by itself, with its stderr.

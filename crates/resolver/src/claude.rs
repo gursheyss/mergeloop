@@ -48,6 +48,7 @@ impl ClaudeResolver {
         workdir: &Path,
         prompt: String,
         access: Access,
+        offline: bool,
     ) -> Result<tokio::process::Command> {
         let key = self
             .api_key
@@ -60,6 +61,9 @@ impl ClaudeResolver {
         if let Some(url) = &self.base_url {
             cmd.env("ANTHROPIC_BASE_URL", url);
             cli::bypass_proxy(&mut cmd, url);
+        }
+        if offline {
+            cli::offline(&mut cmd);
         }
         cmd.arg("-p")
             .arg(prompt)
@@ -84,8 +88,9 @@ impl ClaudeResolver {
         prompt: String,
         access: Access,
         transcript_path: &Path,
+        offline: bool,
     ) -> Result<Resolution> {
-        let cmd = self.command(workdir, prompt, access)?;
+        let cmd = self.command(workdir, prompt, access, offline)?;
         let mut turns = 0;
         let mut result = None;
         let ended = cli::stream(cmd, "claude", self.timeout, transcript_path, |event| {
@@ -149,26 +154,39 @@ impl Resolver for ClaudeResolver {
     }
 
     async fn resolve(&self, req: ResolveRequest<'_>) -> Result<Resolution> {
-        self.run(req.workdir, prompt(&req), Access::Edit, req.transcript)
-            .await
+        let offline = req.verify.pinned();
+        self.run(
+            req.workdir,
+            prompt(&req),
+            Access::Edit,
+            req.transcript,
+            offline,
+        )
+        .await
     }
 
     async fn fix(&self, req: FixRequest<'_>) -> Result<Resolution> {
-        self.run(req.workdir, fix_prompt(&req), Access::Edit, req.transcript)
-            .await
+        self.run(
+            req.workdir,
+            fix_prompt(&req),
+            Access::Edit,
+            req.transcript,
+            false,
+        )
+        .await
     }
 
     async fn review(&self, req: ReviewRequest<'_>) -> Result<Resolution> {
         let prompt = review_prompt(&req);
         // It runs the repo and writes tests, to show what it finds: the job keeps none of it but
         // what a finding's evidence names, and returns no code.
-        self.run(req.workdir, prompt, Access::Edit, req.transcript)
+        self.run(req.workdir, prompt, Access::Edit, req.transcript, false)
             .await
     }
 
     async fn question(&self, req: QuestionRequest<'_>) -> Result<Resolution> {
         let prompt = question_prompt(&req);
-        self.run(req.workdir, prompt, Access::Read, req.transcript)
+        self.run(req.workdir, prompt, Access::Read, req.transcript, false)
             .await
     }
 }
@@ -225,7 +243,7 @@ mod tests {
             max_turns: 1,
         };
         let cmd = resolver
-            .command(Path::new("."), "p".into(), Access::Edit)
+            .command(Path::new("."), "p".into(), Access::Edit, false)
             .unwrap();
         assert_eq!(env(&cmd, "ANTHROPIC_API_KEY").as_deref(), Some("job-token"));
         assert_eq!(
@@ -234,6 +252,15 @@ mod tests {
         );
         assert_eq!(env(&cmd, "NO_PROXY").as_deref(), Some("orchestrator"));
         assert_eq!(env(&cmd, "no_proxy").as_deref(), Some("orchestrator"));
+        assert_eq!(env(&cmd, "pnpm_config_offline"), None);
+        let offline = resolver
+            .command(Path::new("."), "p".into(), Access::Edit, true)
+            .unwrap();
+        assert_eq!(
+            env(&offline, "pnpm_config_offline").as_deref(),
+            Some("true")
+        );
+        assert_eq!(env(&offline, "npm_config_offline").as_deref(), Some("true"));
     }
 
     #[test]

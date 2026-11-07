@@ -54,6 +54,12 @@ impl Verify {
         }
     }
 
+    /// The repo pinned the commands a resolution or a fix must pass, so its agent runs those and
+    /// leaves the rest of the repo's checks to CI.
+    pub(crate) fn pinned(&self) -> bool {
+        matches!(self, Verify::Configured(_))
+    }
+
     /// The commands as a prompt lists them.
     fn listed(&self) -> String {
         self.commands()
@@ -232,6 +238,19 @@ pub(crate) fn prompt(req: &ResolveRequest<'_>) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     let verify = verify_section(req.verify, "resolve");
+    let generated = if req.verify.pinned() {
+        "A generated file, such as a lockfile, a schema or a digest of one, is merged by hand: keep \
+both sides, the way its generator would combine them. If only its generator can rebuild it, give \
+up.
+
+This job installs nothing: package managers run offline here. Run none of the repo's builds, \
+tests, linters or exports either. CI tests the result once MergeLoop publishes it."
+    } else {
+        "A generated file, such as a lockfile, a schema or a digest of one, is regenerated, not merged: \
+take either side to clear its conflict markers, then run the repo's generator. `AGENTS.md`, \
+`CLAUDE.md` and the repo's docs say how. You have a shell, and may install what the generator \
+needs."
+    };
     format!(
         "You are resolving a rebase conflict for a merge queue.
 
@@ -251,10 +270,7 @@ These files have conflict markers:
 Resolve the conflicts so that the result keeps the intent of the pull request AND the changes \
 that landed on `{trunk}`. Use `git log`, `git show` and `git diff` to understand both sides.
 
-A generated file, such as a lockfile, a schema or a digest of one, is regenerated, not merged: \
-take either side to clear its conflict markers, then run the repo's generator. `AGENTS.md`, \
-`CLAUDE.md` and the repo's docs say how. You have a shell, and may install what the generator \
-needs.
+{generated}
 
 Rules:
 - Edit only the files listed above, and other files of the pull request that a generator rewrites. \
@@ -357,6 +373,13 @@ pub(crate) fn fix_prompt(req: &FixRequest<'_>) -> String {
         .collect::<Vec<_>>()
         .join("\n\n");
     let verify = verify_section(req.verify, "fix");
+    let scope = if req.verify.pinned() {
+        "Reproduce a failure with the narrowest command that covers it, such as one package's \
+typecheck or one test file. Run neither the repo's whole check suite nor its builds or exports: CI \
+runs them on the published fix.\n\n"
+    } else {
+        ""
+    };
     format!(
         "You are fixing the failed CI checks of a pull request for a merge queue.
 
@@ -373,7 +396,7 @@ What GitHub shows of the failures:
 Find out why they fail, and change the code so that they pass. Use `git log`, `git show` and \
 `git diff {trunk}...HEAD` to see what the pull request changes.
 
-A commit cannot change the pull request's title. When all that fails is a check of that title, \
+{scope}A commit cannot change the pull request's title. When all that fails is a check of that title, \
 change nothing, and reply with one line: `{RETITLE} <the new title>`. Keep what the title says, \
 in the form that the failure and the repo's docs ask for.
 
@@ -635,6 +658,61 @@ mod prompt_tests {
     use std::path::Path;
 
     use super::*;
+
+    fn resolve_prompt(verify: &Verify) -> String {
+        prompt(&ResolveRequest {
+            workdir: Path::new("."),
+            conflicted_files: &["a.json".into()],
+            pr_title: "t",
+            pr_body: "b",
+            commit_message: "m",
+            trunk: "main",
+            verify,
+            transcript: Path::new("t"),
+        })
+    }
+
+    fn checks_prompt(verify: &Verify) -> String {
+        fix_prompt(&FixRequest {
+            workdir: Path::new("."),
+            failures: &[CheckFailure {
+                name: "test".into(),
+                details: "failed".into(),
+            }],
+            findings: &[],
+            pr_title: "t",
+            pr_body: "b",
+            trunk: "main",
+            verify,
+            transcript: Path::new("t"),
+        })
+    }
+
+    #[test]
+    fn a_resolution_checked_by_pinned_commands_installs_nothing() {
+        let pinned = resolve_prompt(&Verify::Configured(vec!["git diff --check".into()]));
+        assert!(pinned.contains("This job installs nothing"));
+        assert!(pinned.contains("merged by hand"));
+        assert!(pinned.contains("CI tests the result"));
+        assert!(pinned.contains("- `git diff --check`"));
+        assert!(!pinned.contains("may install"));
+        // A repo that pins nothing still has its generator run, and may install what it needs.
+        for verify in [Verify::Ci(vec!["pnpm test".into()]), Verify::None] {
+            let open = resolve_prompt(&verify);
+            assert!(open.contains("may install what the generator"));
+            assert!(!open.contains("installs nothing"));
+        }
+    }
+
+    #[test]
+    fn a_fix_checked_by_pinned_commands_runs_only_the_narrowest_command() {
+        let pinned = checks_prompt(&Verify::Configured(vec!["git diff --check".into()]));
+        assert!(pinned.contains("narrowest command that covers it"));
+        assert!(pinned.contains("CI runs them on the published fix"));
+        assert!(pinned.contains("- `git diff --check`"));
+        let open = checks_prompt(&Verify::Ci(vec!["pnpm test".into()]));
+        assert!(!open.contains("narrowest command"));
+    }
 
     #[test]
     fn a_review_holds_a_pr_only_for_what_must_change() {
