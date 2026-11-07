@@ -1505,6 +1505,7 @@ fn ctx(store: Arc<Mem>) -> Ctx {
             posthog_key: None,
             posthog_host: String::new(),
             stripe: None,
+            head_checks: Vec::new(),
         },
         hosted_app: None,
         vault: Arc::new(Vault::new(store.clone(), &format!("{}=", "A".repeat(43))).unwrap()),
@@ -1637,6 +1638,7 @@ fn behind_and_green(s: &mut State) {
 }
 
 mod fresh_base;
+mod head_checks;
 
 #[tokio::test(start_paused = true)]
 async fn a_green_pr_that_merges_cleanly_skips_the_rebase() {

@@ -949,7 +949,8 @@ async fn tick_lane(
 
     // GitHub merges a PR behind the trunk, which a batch's PRs are, unless the trunk is strict.
     if next.len() > 1 && !rules.strict {
-        let ready = batchable(gh, repo, &units, &rules.checks, &next).await?;
+        let head_checks = ctx.config.head_checks(repo);
+        let ready = batchable(gh, repo, &units, &rules.checks, &head_checks, &next).await?;
         if let Some(batch) = build_batch(ctx, gh, &key, &snap, &mut lane, &ready).await? {
             run_batch(ctx, &settings, gh, &key, &snap, &mut lane, batch).await?;
             return Ok(Ran::Job);
@@ -1655,12 +1656,14 @@ async fn comment_all(gh: &dyn GitHub, repo: &RepoName, prs: &[PrNumber], body: &
 }
 
 /// The units of `next` that can join a batch as they are, in order, up to the first that cannot:
-/// GitHub must merge each without a rebase, so the required checks of each of its PRs passed.
+/// GitHub must merge each without a rebase, so the required checks of each of its PRs passed. So
+/// did its head checks, which run on each PR's own head and not on the batch's draft.
 async fn batchable(
     gh: &dyn GitHub,
     repo: &RepoName,
     units: &[Unit],
     required: &[String],
+    head_checks: &[String],
     next: &[PrNumber],
 ) -> Result<Vec<Unit>> {
     let mut ready = Vec::new();
@@ -1674,7 +1677,9 @@ async fn batchable(
         }
         for pr in &unit.layers {
             let checks = gh.checks(repo, &pr.head_ref_oid).await?;
-            if checks.verdict(required).0 != CheckState::Passed {
+            if checks.verdict(required).0 != CheckState::Passed
+                || checks.head_verdict(head_checks).0 != CheckState::Passed
+            {
                 break 'next;
             }
         }
@@ -1842,8 +1847,17 @@ async fn resume_merge(
     let current = open.is_none()
         || !settings.test_current_main
         || merge.base.as_deref() == Some(gh.live_branch_sha(repo, &key.trunk).await?.as_str());
+    let head_checks = ctx.config.head_checks(repo);
+    let gated = match open {
+        Some(unit) => matches!(
+            head_gate(gh, repo, unit, &head_checks).await?,
+            HeadGate::Passed
+        ),
+        None => true,
+    };
     let sha = if let Some(unit) = open
         && current
+        && gated
     {
         match gh
             .merge(repo, merge.top, &merge.head, method, unit.stacked)
@@ -2117,7 +2131,7 @@ async fn test_and_merge(
         if let Some(why) = stale(&trunk_sha, &now_units, batch) {
             break Tested::Stale(why);
         }
-        let checks = checks_verdict(gh, key, head, opened, &[]).await?;
+        let checks = checks_verdict(gh, key, head, opened, &[], &[]).await?;
         let silent = checks
             .unreported
             .into_iter()
@@ -2222,6 +2236,18 @@ async fn merge_batch(
         if let Some(reason) = now.hold_reason() {
             return finish(ctx, settings, gh, key, lane, tested, Outcome::Held(reason)).await;
         }
+        match head_gate(gh, repo, tested, &ctx.config.head_checks(repo)).await? {
+            HeadGate::Passed => {}
+            HeadGate::Failed(reason) => {
+                let ejected = Outcome::Ejected(reason);
+                return finish(ctx, settings, gh, key, lane, tested, ejected).await;
+            }
+            HeadGate::Pending(names) => {
+                let why = format!("{} must pass first", names.join(", "));
+                record_all(ctx, key, &tested.prs(), "batch-stopped", &why).await?;
+                return Ok(());
+            }
+        }
         let top = tested.top();
         let method = merge_method(gh, key, snap).await?;
         let base = settings.test_current_main.then_some(expected_base.as_str());
@@ -2266,13 +2292,15 @@ fn head_shas(unit: &Unit) -> Vec<String> {
 
 /// The verdict on `head`'s checks, against the trunk's required checks as they are now, not as
 /// the job began: a ruleset may change while it waits. With none required, every check counts,
-/// and a pass only after `NO_CHECKS_GRACE` from `published`.
+/// and a pass only after `NO_CHECKS_GRACE` from `published`. `head_checks` must pass too: the
+/// verdict waits for them, and `rejected` names those that failed.
 async fn checks_verdict(
     gh: &dyn GitHub,
     key: &LaneKey,
     head: &str,
     published: Instant,
     rechecking: &[String],
+    head_checks: &[String],
 ) -> Result<HeadChecks> {
     let mut required = gh.branch_rules(&key.repo, &key.trunk).await?.checks;
     let none_required = required.is_empty();
@@ -2301,6 +2329,20 @@ async fn checks_verdict(
         (CheckState::Passed, _) if !skipped.is_empty() => (CheckState::Failed, skipped),
         v => v,
     };
+    let (head_state, head_names) = checks.head_verdict(head_checks);
+    let verdict = match (verdict, head_state) {
+        ((CheckState::Passed, _), CheckState::Pending) => (CheckState::Pending, head_names.clone()),
+        ((CheckState::Pending, mut names), CheckState::Pending) => {
+            names.extend(head_names.iter().cloned());
+            (CheckState::Pending, names)
+        }
+        (v, _) => v,
+    };
+    let rejected = match head_state {
+        CheckState::Failed => head_names,
+        _ => Vec::new(),
+    };
+    required.extend(head_checks.iter().cloned());
     let mut unreported = checks.unreported(&required);
     // A workflow run queued behind its concurrency group has no check runs yet: with no Actions
     // check run on the head, its runs were not read. Only a countdown to eject reads them.
@@ -2313,6 +2355,7 @@ async fn checks_verdict(
     Ok(HeadChecks {
         verdict,
         unreported,
+        rejected,
     })
 }
 
@@ -2331,6 +2374,51 @@ struct HeadChecks {
     verdict: (CheckState, Vec<String>),
     /// The required checks that never reported on the head, though no other check runs.
     unreported: Vec<String>,
+    /// The head checks that failed.
+    rejected: Vec<String>,
+}
+
+/// Where the checks that must pass on each of a unit's own heads stand.
+enum HeadGate {
+    Passed,
+    /// The checks still pending or unreported, with the PR of each.
+    Pending(Vec<String>),
+    /// One failed: the first head where any did, and which.
+    Failed(EjectReason),
+}
+
+/// Whether `head_checks` passed on the head of each of `unit`'s PRs, as it is: what would merge.
+async fn head_gate(
+    gh: &dyn GitHub,
+    repo: &RepoName,
+    unit: &Unit,
+    head_checks: &[String],
+) -> Result<HeadGate> {
+    if head_checks.is_empty() {
+        return Ok(HeadGate::Passed);
+    }
+    let mut pending = Vec::new();
+    for pr in &unit.layers {
+        let head = &pr.head_ref_oid;
+        let (state, names) = gh.checks(repo, head).await?.head_verdict(head_checks);
+        match state {
+            CheckState::Passed => {}
+            CheckState::Pending => {
+                pending.extend(names.into_iter().map(|n| format!("{n} on #{}", pr.number)));
+            }
+            CheckState::Failed => {
+                let head = head.clone();
+                return Ok(HeadGate::Failed(EjectReason::HeadChecksFailed {
+                    head,
+                    names,
+                }));
+            }
+        }
+    }
+    Ok(match pending.is_empty() {
+        true => HeadGate::Passed,
+        false => HeadGate::Pending(pending),
+    })
 }
 
 /// Since when each required check has gone unreported on each of a job's heads, with no other
@@ -2513,6 +2601,7 @@ async fn run_job(
     let mut may_skip_rebase = true;
     let mut as_is = false;
     let mut tested_base = None;
+    let head_checks = ctx.config.head_checks(repo);
 
     loop {
         let mut now = unit.refreshed(gh, repo).await?;
@@ -2541,6 +2630,9 @@ async fn run_job(
 
         let event = match &job.phase {
             Phase::Rebasing => 'rebase: {
+                if let HeadGate::Failed(reason) = head_gate(gh, repo, &now, &head_checks).await? {
+                    return Ok(Outcome::Ejected(reason));
+                }
                 as_is = std::mem::take(&mut may_skip_rebase)
                     && !settings.test_current_main
                     && merges_as_is(gh, key, lane, &now).await?;
@@ -2623,7 +2715,15 @@ async fn run_job(
                             .as_ref()
                             .filter(|(rechecked, _)| rechecked == head)
                             .map_or(&[][..], |(_, names)| names.as_slice());
-                        let checks = checks_verdict(gh, key, head, published_at, again).await?;
+                        let checks =
+                            checks_verdict(gh, key, head, published_at, again, &head_checks)
+                                .await?;
+                        if !checks.rejected.is_empty() {
+                            let head = head.clone();
+                            let names = checks.rejected;
+                            let reason = EjectReason::HeadChecksFailed { head, names };
+                            return Ok(Outcome::Ejected(reason));
+                        }
                         silent.extend(checks.unreported.into_iter().map(|n| (head.clone(), n)));
                         match checks.verdict {
                             (CheckState::Failed, names) => {

@@ -262,12 +262,25 @@ pub(super) async fn hold(
         return Ok(Some(ctx.prep.want(id, Hold::PrepRebasing, wanted)));
     }
     let required = gh.branch_rules(&key.repo, &key.trunk).await?.checks;
+    let head_checks = ctx.config.head_checks(&key.repo);
     // Bottom to top: a fix moves the layers above it.
     let mut waiting = false;
     for (layer, pr) in unit.layers.iter().enumerate() {
         let sha = pr.head_ref_oid.as_str();
         let checks = gh.checks(&key.repo, sha).await?;
-        let (state, names) = checks.verdict(&required);
+        let (head_state, head_names) = checks.head_verdict(&head_checks);
+        // No fix makes a head check pass on this head: the lane ejects the unit.
+        if head_state == CheckState::Failed {
+            return Ok(None);
+        }
+        let (state, names) = match (checks.verdict(&required), head_state) {
+            ((CheckState::Passed, _), CheckState::Pending) => (CheckState::Pending, head_names),
+            ((CheckState::Pending, mut names), CheckState::Pending) => {
+                names.extend(head_names);
+                (CheckState::Pending, names)
+            }
+            (v, _) => v,
+        };
         match state {
             CheckState::Passed => {}
             CheckState::Failed => {

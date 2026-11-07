@@ -51,6 +51,12 @@ pub enum EjectReason {
     ChecksMissing(Vec<String>),
     /// What the queue would have to do to a fork PR, it may not.
     Fork(String),
+    /// These checks, which must pass on the PR's own head beside the required ones, failed on
+    /// `head`.
+    HeadChecksFailed {
+        head: String,
+        names: Vec<String>,
+    },
 }
 
 /// How long a PR's required checks may take, after a publish. A check that never finishes would
@@ -75,6 +81,7 @@ impl EjectReason {
             Self::ChecksTimedOut(_) => "checks-timed-out",
             Self::ChecksMissing(_) => "checks-missing",
             Self::Fork(_) => "fork",
+            Self::HeadChecksFailed { .. } => "head-checks-failed",
         }
     }
 }
@@ -116,6 +123,12 @@ impl std::fmt::Display for EjectReason {
                 names.join(", ")
             ),
             Self::Fork(r) => f.write_str(r),
+            Self::HeadChecksFailed { head, names } => write!(
+                f,
+                "{} failed on {}, and this repo needs it to pass on the exact head that merges",
+                names.join(", "),
+                &head[..head.len().min(7)]
+            ),
         }
     }
 }

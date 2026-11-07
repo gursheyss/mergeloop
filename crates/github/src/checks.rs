@@ -65,6 +65,15 @@ impl Checks {
         }
     }
 
+    /// The verdict for checks that must pass on this commit beside the required ones, with the
+    /// checks that failed, or else those still pending or unreported: passed when there are none.
+    pub fn head_verdict(&self, names: &[String]) -> (CheckState, Vec<String>) {
+        if names.is_empty() {
+            return (CheckState::Passed, Vec::new());
+        }
+        self.verdict(names)
+    }
+
     /// The `required` checks that never reported on the commit, once no check that did is still
     /// running: CI is done, and does not run them, as when a PR renames one. Empty while any
     /// check runs, as a job that waits for another creates its check only when it starts, and
@@ -842,6 +851,24 @@ mod tests {
         };
         assert_eq!(no_merge.merge_method("rebase"), "rebase");
         assert_eq!(no_merge.merge_method("merge"), "squash");
+    }
+
+    #[test]
+    fn head_checks_are_their_own_verdict_and_none_pass() {
+        let c = checks(&[
+            ("test", CheckState::Passed),
+            ("review", CheckState::Failed),
+            ("lint", CheckState::Pending),
+        ]);
+        assert_eq!(c.head_verdict(&[]), (CheckState::Passed, vec![]));
+        assert_eq!(
+            c.head_verdict(&["review".into()]),
+            (CheckState::Failed, vec!["review".to_owned()])
+        );
+        assert_eq!(
+            c.head_verdict(&["bot".into()]),
+            (CheckState::Pending, vec!["bot".to_owned()])
+        );
     }
 
     #[test]

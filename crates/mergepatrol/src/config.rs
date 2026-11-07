@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use mergepatrol_billing::StripeConfig;
-use mergepatrol_core::{AgentSettings, Provider, RepoSettings};
+use mergepatrol_core::{AgentSettings, Provider, RepoName, RepoSettings};
 use mergepatrol_executor::job_files::JobFile;
 
 /// Settings from the environment. Everything else is set up in the dashboard, or in each repo's
@@ -39,6 +39,59 @@ pub struct Config {
     pub posthog_host: String,
     /// Billing, hosted. Off without it, as when self-hosted: no plan limits.
     pub stripe: Option<StripeConfig>,
+    /// `MERGEPATROL_HEAD_CHECKS`: per repo, checks that must pass on each PR's own head before
+    /// it merges, beside the trunk's required checks.
+    pub head_checks: Vec<HeadCheck>,
+}
+
+/// A check that must pass on a PR's own head, the exact commit that merges, though no ruleset
+/// requires it: one that runs on a PR and not on a batch's draft PR, such as a review bot's. The
+/// queue waits while it runs and ejects the PR when it fails. A batch's draft PR does not need
+/// it, but each PR in the batch does, on its own head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadCheck {
+    pub repo: RepoName,
+    pub name: String,
+}
+
+impl HeadCheck {
+    /// `owner/name:<check>` entries, separated by semicolons: a check's name may have a comma.
+    pub fn parse_list(s: &str) -> Result<Vec<Self>> {
+        s.split(';')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let Some((repo, name)) = entry.split_once(':') else {
+                    bail!("{entry:?} is not owner/name:<check>");
+                };
+                let Some(repo) = RepoName::parse(repo.trim()) else {
+                    bail!("{entry:?}: {repo:?} is not owner/name");
+                };
+                let name = name.trim();
+                if name.is_empty() {
+                    bail!("{entry:?} names no check");
+                }
+                Ok(Self {
+                    repo,
+                    name: name.into(),
+                })
+            })
+            .collect()
+    }
+}
+
+impl Config {
+    /// The checks that must pass on the head of each PR of `repo` that merges.
+    pub fn head_checks(&self, repo: &RepoName) -> Vec<String> {
+        self.head_checks
+            .iter()
+            .filter(|c| {
+                c.repo.owner.eq_ignore_ascii_case(&repo.owner)
+                    && c.repo.name.eq_ignore_ascii_case(&repo.name)
+            })
+            .map(|c| c.name.clone())
+            .collect()
+    }
 }
 
 /// Where rebase jobs run.
@@ -158,6 +211,12 @@ impl Config {
             posthog_key: var("MERGEPATROL_POSTHOG_KEY"),
             posthog_host: opt("MERGEPATROL_POSTHOG_HOST", "https://us.i.posthog.com"),
             stripe: stripe()?,
+            head_checks: var("MERGEPATROL_HEAD_CHECKS")
+                .as_deref()
+                .map(HeadCheck::parse_list)
+                .transpose()
+                .context("MERGEPATROL_HEAD_CHECKS")?
+                .unwrap_or_default(),
         })
     }
 }
@@ -240,4 +299,76 @@ fn req(name: &str) -> Result<String> {
 
 fn opt(name: &str, default: &str) -> String {
     var(name).unwrap_or_else(|| default.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn head_checks_are_per_repo_and_may_have_commas() {
+        let checks = HeadCheck::parse_list(
+            " productstudioinc/halo:review ; o/r:Lint, typecheck, test (affected);;o/r:review",
+        )
+        .unwrap();
+        let config = |head_checks| Config {
+            head_checks,
+            ..test_config()
+        };
+        let config = config(checks);
+        let halo = RepoName::parse("ProductStudioInc/Halo").unwrap();
+        assert_eq!(config.head_checks(&halo), ["review"]);
+        let or = RepoName::parse("o/r").unwrap();
+        assert_eq!(
+            config.head_checks(&or),
+            ["Lint, typecheck, test (affected)", "review"]
+        );
+        let other = RepoName::parse("o/other").unwrap();
+        assert!(config.head_checks(&other).is_empty());
+    }
+
+    #[test]
+    fn a_head_check_needs_a_repo_and_a_name() {
+        for bad in ["review", "halo:review", "o/r:", "o/r/x:review"] {
+            assert!(HeadCheck::parse_list(bad).is_err(), "{bad}");
+        }
+        assert!(HeadCheck::parse_list("").unwrap().is_empty());
+    }
+
+    fn test_config() -> Config {
+        Config {
+            secret_key: String::new(),
+            database_url: String::new(),
+            hosted_app: None,
+            public_url: String::new(),
+            repo_defaults: RepoSettings {
+                label: "mergepatrol".into(),
+                batch_size: 1,
+                test_current_main: false,
+                preserve_reviewed_content: false,
+                agent: AgentSettings {
+                    provider: Provider::Anthropic,
+                    model: "m".into(),
+                    effort: "medium".into(),
+                    overrides: Default::default(),
+                },
+                verify: Vec::new(),
+                fix_ci: Default::default(),
+                branches: Vec::new(),
+                review: Default::default(),
+            },
+            data_dir: PathBuf::new(),
+            poll: Duration::from_secs(60),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            max_jobs: 1,
+            prep: true,
+            executor: ExecutorConfig::Local,
+            job_proxy_url: String::new(),
+            job_proxy_bind: None,
+            posthog_key: None,
+            posthog_host: String::new(),
+            stripe: None,
+            head_checks: Vec::new(),
+        }
+    }
 }
